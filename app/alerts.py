@@ -47,7 +47,7 @@ def evaluate_risk(
     imbalance = metrics.get("imbalance", 0.0)
 
     reasons: List[str] = []
-    if abs(funding) >= 0.08:
+    if abs(funding) >= 0.001:
         reasons.append("Funding rate extremo")
     if abs(imbalance) >= 0.35:
         reasons.append("Imbalance del order book muy alto")
@@ -126,7 +126,7 @@ def assess_market_stress(
     oi = metrics.get("open_interest", 0.0)
 
     score = 0
-    if abs(funding) >= 0.08:
+    if abs(funding) >= 0.001:
         score += 1
     if abs(imbalance) >= 0.35:
         score += 1

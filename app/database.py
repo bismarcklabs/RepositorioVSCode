@@ -1,0 +1,959 @@
+"""Capa de persistencia SQLite para el crypto dashboard.
+
+Diseño:
+- WAL mode + synchronous=NORMAL para soportar escrituras concurrentes sin lock.
+- Una conexión por hilo (thread-local) para evitar conflictos.
+- Todos los errores se capturan y logean; nunca propagan al llamador.
+- Inserciones de snapshots en batch (un executemany por ciclo de scan).
+"""
+
+import json
+import logging
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.config import DATABASE_PATH, SNAPSHOT_RETENTION_DAYS, SNAPSHOT_MIN_SCORE
+
+logger = logging.getLogger("database")
+
+_db_local = threading.local()
+_init_lock = threading.Lock()
+_db_initialized = False
+
+
+# ── Conexión ──────────────────────────────────────────────────────────────
+
+def _get_conn() -> sqlite3.Connection:
+    if not hasattr(_db_local, "conn") or _db_local.conn is None:
+        db_path = Path(DATABASE_PATH)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        # timeout=30 → Python espera hasta 30s por el lock antes de lanzar OperationalError
+        conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA foreign_keys=ON;")
+        # busy_timeout=30000ms → SQLite espera 30s a nivel de motor (refuerza el timeout de Python)
+        conn.execute("PRAGMA busy_timeout=30000;")
+        # Checkpoint automático cada 200 páginas — evita que el WAL file crezca indefinidamente
+        conn.execute("PRAGMA wal_autocheckpoint=200;")
+        # Cache de 32MB por conexión — reduce I/O en lecturas repetidas del dashboard
+        conn.execute("PRAGMA cache_size=-32000;")
+        _db_local.conn = conn
+    return _db_local.conn
+
+
+# ── Inicialización de tablas ──────────────────────────────────────────────
+
+def _migrate_schema() -> None:
+    """Agrega columnas nuevas a tablas existentes de forma idempotente.
+
+    SQLite no soporta ALTER TABLE ... ADD COLUMN IF NOT EXISTS, así que
+    intentamos cada ALTER y silenciamos el error de columna duplicada.
+    """
+    conn = _get_conn()
+    new_columns = [
+        ("market_snapshots", "cvd_15m",              "REAL DEFAULT 0"),
+        ("market_snapshots", "atr",                  "REAL DEFAULT 0"),
+        ("market_snapshots", "atr_pct",              "REAL DEFAULT 0"),
+        ("market_snapshots", "htf_trend_bias",       "TEXT DEFAULT 'neutral'"),
+        ("market_snapshots", "rsi",                  "REAL DEFAULT 50"),
+        ("market_snapshots", "oi_change_pct",        "REAL DEFAULT 0"),
+        # sub-scores individuales (para ML y modo DB-display)
+        ("market_snapshots", "flow_score",           "INTEGER DEFAULT 0"),
+        ("market_snapshots", "technical_score",      "INTEGER DEFAULT 0"),
+        ("market_snapshots", "volume_profile_score", "INTEGER DEFAULT 0"),
+        ("market_snapshots", "footprint_score",      "INTEGER DEFAULT 0"),
+        ("market_snapshots", "futures_score",        "INTEGER DEFAULT 0"),
+        ("market_snapshots", "risk_penalty",         "INTEGER DEFAULT 0"),
+        ("market_snapshots", "confluence_score",     "INTEGER DEFAULT 0"),
+        # contexto completo serializado (para reconstruir la UI desde DB)
+        ("market_snapshots", "recommendation_json",  "TEXT DEFAULT '{}'"),
+        ("market_snapshots", "signal_json",          "TEXT DEFAULT '{}'"),
+        ("market_snapshots", "alert_report_json",    "TEXT DEFAULT '{}'"),
+    ]
+    for table, col, col_def in new_columns:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+            conn.commit()
+            logger.info("Columna agregada: %s.%s", table, col)
+        except Exception:
+            pass  # ya existe
+
+
+def init_db() -> None:
+    global _db_initialized
+    with _init_lock:
+        if _db_initialized:
+            return
+        try:
+            conn = _get_conn()
+            conn.executescript("""
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,
+                    price           REAL,
+                    futures_price   REAL,
+                    action          TEXT,
+                    market          TEXT,
+                    confidence      INTEGER,
+                    score           INTEGER,
+                    signal          TEXT,
+                    risk_level      TEXT,
+
+                    delta           REAL,
+                    cvd             REAL,
+                    buy_volume      REAL,
+                    sell_volume     REAL,
+                    funding         REAL,
+                    open_interest   REAL,
+                    imbalance       REAL,
+                    spread_pct      REAL,
+
+                    return_15m      REAL,
+                    return_1h       REAL,
+                    vwap            REAL,
+                    vwap_distance_pct REAL,
+                    above_vwap      INTEGER,
+                    relative_volume REAL,
+                    trend_bias      TEXT,
+
+                    poc             REAL,
+                    nearest_vp_level REAL,
+                    nearest_vp_type  TEXT,
+                    vp_distance     REAL,
+
+                    footprint_delta      REAL,
+                    absorption_buy       INTEGER,
+                    absorption_sell      INTEGER,
+                    stacked_buy_imbalance  INTEGER,
+                    stacked_sell_imbalance INTEGER,
+
+                    gex_available   INTEGER,
+                    gex_score       INTEGER,
+                    call_wall       REAL,
+                    put_wall        REAL,
+                    gamma_flip      REAL,
+
+                    entry           REAL,
+                    entry_zone_low  REAL,
+                    entry_zone_high REAL,
+                    stop_loss       REAL,
+                    take_profit_1   REAL,
+                    take_profit_2   REAL,
+                    risk_reward_1   REAL,
+                    risk_reward_2   REAL,
+
+                    reasons_json    TEXT,
+                    warnings_json   TEXT,
+                    invalidation_json TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_snapshots_sym_ts
+                    ON market_snapshots(symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_snapshots_ts
+                    ON market_snapshots(timestamp);
+
+                CREATE TABLE IF NOT EXISTS trade_alerts (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,
+                    action          TEXT    NOT NULL,
+                    market          TEXT    NOT NULL,
+                    confidence      INTEGER,
+                    score           INTEGER,
+                    price           REAL,
+                    entry           REAL,
+                    stop_loss       REAL,
+                    take_profit_1   REAL,
+                    take_profit_2   REAL,
+                    risk_reward_1   REAL,
+                    risk_reward_2   REAL,
+                    status          TEXT    DEFAULT 'open'
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_alerts_sym_ts
+                    ON trade_alerts(symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_alerts_status
+                    ON trade_alerts(status);
+
+                CREATE TABLE IF NOT EXISTS notification_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    alert_id        INTEGER REFERENCES trade_alerts(id),
+                    symbol          TEXT    NOT NULL,
+                    action          TEXT    NOT NULL,
+                    channel         TEXT    NOT NULL,
+                    ok              INTEGER NOT NULL,
+                    error           TEXT    DEFAULT '',
+                    cooldown_skipped INTEGER DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_notif_alert_id
+                    ON notification_log(alert_id);
+
+                CREATE TABLE IF NOT EXISTS alert_outcomes (
+                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id                INTEGER NOT NULL REFERENCES trade_alerts(id),
+                    checked_at              TEXT    NOT NULL,
+                    horizon_minutes         INTEGER NOT NULL,
+                    price_at_check          REAL,
+                    future_return_pct       REAL,
+                    max_favorable_excursion REAL,
+                    max_adverse_excursion   REAL,
+                    hit_tp1                 INTEGER DEFAULT 0,
+                    hit_tp2                 INTEGER DEFAULT 0,
+                    hit_stop                INTEGER DEFAULT 0,
+                    outcome                 TEXT    DEFAULT 'unknown',
+                    UNIQUE(alert_id, horizon_minutes)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_outcomes_alert_id
+                    ON alert_outcomes(alert_id);
+
+                CREATE TABLE IF NOT EXISTS auto_positions (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id        INTEGER REFERENCES trade_alerts(id),
+                    symbol          TEXT    NOT NULL,
+                    action          TEXT    NOT NULL,
+                    mode            TEXT    NOT NULL DEFAULT 'paper',
+                    open_time       TEXT    NOT NULL,
+                    close_time      TEXT,
+                    entry_price     REAL    NOT NULL,
+                    size_usdt       REAL    NOT NULL,
+                    leverage        INTEGER NOT NULL DEFAULT 1,
+                    tp1             REAL,
+                    tp2             REAL,
+                    sl              REAL    NOT NULL,
+                    sl_current      REAL    NOT NULL,
+                    status          TEXT    NOT NULL DEFAULT 'open',
+                    tp1_hit         INTEGER NOT NULL DEFAULT 0,
+                    tp1_pnl_usdt    REAL    NOT NULL DEFAULT 0.0,
+                    close_reason    TEXT,
+                    exit_price      REAL,
+                    final_pnl_usdt  REAL,
+                    total_pnl_usdt  REAL,
+                    total_pnl_pct   REAL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_autopos_status
+                    ON auto_positions(status);
+                CREATE INDEX IF NOT EXISTS idx_autopos_symbol
+                    ON auto_positions(symbol, status);
+            """)
+            conn.commit()
+            _migrate_schema()
+            _db_initialized = True
+            logger.info("Base de datos inicializada: %s", DATABASE_PATH)
+        except Exception:
+            logger.exception("Error al inicializar la base de datos")
+
+
+# ── Snapshots ─────────────────────────────────────────────────────────────
+
+def _snapshot_row(data: Dict[str, Any]) -> Tuple:
+    """Extrae una tupla ordenada para insertar en market_snapshots."""
+    ts = data.get("timestamp", "")
+    rec = data.get("recommendation", {})
+    setup = rec.get("setup") or {}
+    tech = data.get("technical") or {}
+    vp = data.get("volume_profile") or {}
+    fp = data.get("footprint") or {}
+    gex = data.get("gex") or {}
+    metrics = data.get("metrics") or {}
+    ob = data.get("orderbook") or {}
+    sd = data.get("score_data") or {}
+
+    return (
+        ts,
+        data.get("symbol", ""),
+        data.get("price", 0.0),
+        data.get("futures_price", 0.0),
+        rec.get("action", "WAIT"),
+        rec.get("market", "NONE"),
+        rec.get("confidence", 0),
+        sd.get("score", 0),
+        (data.get("signal") or {}).get("signal", ""),
+        rec.get("risk_level", "low"),
+        # flow
+        metrics.get("delta", 0.0),
+        metrics.get("cvd", 0.0),
+        metrics.get("buy_volume", 0.0),
+        metrics.get("sell_volume", 0.0),
+        data.get("funding", 0.0),
+        data.get("open_interest", 0.0),
+        ob.get("imbalance", 0.0),
+        ob.get("spread_pct", 0.0),
+        # technical
+        tech.get("return_15m", 0.0),
+        tech.get("return_1h", 0.0),
+        tech.get("vwap", 0.0),
+        tech.get("vwap_distance_pct", 0.0),
+        int(bool(tech.get("above_vwap", True))),
+        tech.get("relative_volume", 1.0),
+        tech.get("trend_bias", "neutral"),
+        # volume profile
+        vp.get("poc", 0.0),
+        vp.get("nearest_level", 0.0),
+        vp.get("nearest_level_type", "NONE"),
+        vp.get("distance_to_level_pct", 0.0),
+        # footprint
+        fp.get("footprint_delta", 0.0),
+        int(bool(fp.get("absorption_buy", False))),
+        int(bool(fp.get("absorption_sell", False))),
+        int(bool(fp.get("stacked_buy_imbalance", False))),
+        int(bool(fp.get("stacked_sell_imbalance", False))),
+        # gex
+        int(gex is not None and bool(gex)),
+        sd.get("gex_score", 0),
+        gex.get("call_wall", 0.0),
+        gex.get("put_wall", 0.0),
+        gex.get("gamma_flip", 0.0),
+        # setup levels
+        setup.get("entry", 0.0),
+        setup.get("entry_zone_low", 0.0),
+        setup.get("entry_zone_high", 0.0),
+        setup.get("stop_loss", 0.0),
+        setup.get("take_profit_1", 0.0),
+        setup.get("take_profit_2", 0.0),
+        setup.get("risk_reward_1", 0.0),
+        setup.get("risk_reward_2", 0.0),
+        # json arrays
+        json.dumps(rec.get("reasons", [])),
+        json.dumps(rec.get("warnings", [])),
+        json.dumps(rec.get("invalidation", [])),
+        # nuevas métricas
+        metrics.get("cvd_15m", 0.0),
+        tech.get("atr", 0.0),
+        tech.get("atr_pct", 0.0),
+        tech.get("htf_trend_bias", "neutral"),
+        tech.get("rsi", 50.0),
+        data.get("oi_change_pct", 0.0),
+        # sub-scores
+        sd.get("flow_score", 0),
+        sd.get("technical_score", 0),
+        sd.get("volume_profile_score", 0),
+        sd.get("footprint_score", 0),
+        sd.get("futures_score", 0),
+        sd.get("risk_penalty", 0),
+        rec.get("confluence_score", 0),
+        # contexto completo
+        json.dumps(rec),
+        json.dumps(data.get("signal") or {}),
+        json.dumps(data.get("alert_report") or {}),
+    )
+
+
+_SNAPSHOT_INSERT = """
+    INSERT INTO market_snapshots (
+        timestamp, symbol, price, futures_price,
+        action, market, confidence, score, signal, risk_level,
+        delta, cvd, buy_volume, sell_volume, funding, open_interest,
+        imbalance, spread_pct,
+        return_15m, return_1h, vwap, vwap_distance_pct, above_vwap,
+        relative_volume, trend_bias,
+        poc, nearest_vp_level, nearest_vp_type, vp_distance,
+        footprint_delta, absorption_buy, absorption_sell,
+        stacked_buy_imbalance, stacked_sell_imbalance,
+        gex_available, gex_score, call_wall, put_wall, gamma_flip,
+        entry, entry_zone_low, entry_zone_high, stop_loss,
+        take_profit_1, take_profit_2, risk_reward_1, risk_reward_2,
+        reasons_json, warnings_json, invalidation_json,
+        cvd_15m, atr, atr_pct, htf_trend_bias, rsi, oi_change_pct,
+        flow_score, technical_score, volume_profile_score, footprint_score,
+        futures_score, risk_penalty, confluence_score,
+        recommendation_json, signal_json, alert_report_json
+    ) VALUES (
+        ?,?,?,?,?,?,?,?,?,?,
+        ?,?,?,?,?,?,?,?,
+        ?,?,?,?,?,?,?,
+        ?,?,?,?,
+        ?,?,?,?,?,
+        ?,?,?,?,?,
+        ?,?,?,?,?,?,?,?,
+        ?,?,?,
+        ?,?,?,?,?,?,
+        ?,?,?,?,?,?,?,
+        ?,?,?
+    )
+"""
+
+
+def insert_snapshots_batch(records: List[Dict[str, Any]]) -> None:
+    """Inserta snapshots del ciclo — solo los que superen SNAPSHOT_MIN_SCORE.
+
+    Filtrar aquí reduce el volumen de escrituras de ~288k filas/día (todos los
+    símbolos) a ~50-80k filas/día (solo los interesantes), aliviando el lock.
+    """
+    if not records:
+        return
+    filtered = [r for r in records if (r.get("score_data") or {}).get("score", 0) >= SNAPSHOT_MIN_SCORE]
+    if not filtered:
+        return
+    try:
+        rows = [_snapshot_row(r) for r in filtered]
+        conn = _get_conn()
+        conn.executemany(_SNAPSHOT_INSERT, rows)
+        conn.commit()
+        logger.debug("Snapshots insertados: %d/%d (score>=%d)", len(rows), len(records), SNAPSHOT_MIN_SCORE)
+    except Exception:
+        logger.exception("Error al insertar snapshots")
+
+
+# ── Trade alerts ──────────────────────────────────────────────────────────
+
+def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
+    """Inserta una alerta accionable. Retorna el alert_id o None en error."""
+    setup = data.get("setup") or {}
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """
+            INSERT INTO trade_alerts
+                (timestamp, symbol, action, market, confidence, score,
+                 price, entry, stop_loss, take_profit_1, take_profit_2,
+                 risk_reward_1, risk_reward_2, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+            """,
+            (
+                data.get("timestamp", ""),
+                data.get("symbol", ""),
+                data.get("action", ""),
+                data.get("market", ""),
+                data.get("confidence", 0),
+                data.get("score", 0),
+                data.get("price", 0.0),
+                setup.get("entry", 0.0),
+                setup.get("stop_loss", 0.0),
+                setup.get("take_profit_1", 0.0),
+                setup.get("take_profit_2", 0.0),
+                setup.get("risk_reward_1", 0.0),
+                setup.get("risk_reward_2", 0.0),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        logger.exception("Error al insertar trade_alert")
+        return None
+
+
+def update_alert_status(alert_id: int, status: str) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            "UPDATE trade_alerts SET status=? WHERE id=?",
+            (status, alert_id),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error al actualizar status de alerta %d", alert_id)
+
+
+# ── Notification log ──────────────────────────────────────────────────────
+
+def insert_notification_log(
+    alert_id: Optional[int],
+    symbol: str,
+    action: str,
+    channel: str,
+    ok: bool,
+    error: str = "",
+    cooldown_skipped: bool = False,
+) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            INSERT INTO notification_log
+                (timestamp, alert_id, symbol, action, channel, ok, error, cooldown_skipped)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                _now_iso(),
+                alert_id,
+                symbol,
+                action,
+                channel,
+                int(ok),
+                error,
+                int(cooldown_skipped),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error al insertar notification_log")
+
+
+# ── Cooldown persistente ──────────────────────────────────────────────────
+
+def get_recent_sent_alerts(
+    within_seconds: int = 86400,
+) -> List[Dict[str, Any]]:
+    """Carga alertas enviadas en las últimas `within_seconds` para precalibrar el cooldown."""
+    try:
+        conn = _get_conn()
+        cutoff = time.time() - within_seconds
+        cutoff_iso = _ts_to_iso(cutoff)
+        rows = conn.execute(
+            """
+            SELECT ta.symbol, ta.action, ta.market, ta.confidence, ta.timestamp
+            FROM trade_alerts ta
+            JOIN notification_log nl ON nl.alert_id = ta.id
+            WHERE nl.ok = 1 AND ta.timestamp >= ?
+            ORDER BY ta.timestamp DESC
+            """,
+            (cutoff_iso,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al cargar alertas recientes para cooldown")
+        return []
+
+
+# ── Open alerts (para outcome tracker) ────────────────────────────────────
+
+def get_open_alerts() -> List[Dict[str, Any]]:
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM trade_alerts WHERE status='open' ORDER BY timestamp ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener alertas abiertas")
+        return []
+
+
+def get_evaluated_horizons(alert_id: int) -> List[int]:
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT horizon_minutes FROM alert_outcomes WHERE alert_id=?",
+            (alert_id,),
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        logger.exception("Error al obtener horizontes evaluados para alerta %d", alert_id)
+        return []
+
+
+def insert_alert_outcome(outcome: Dict[str, Any]) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO alert_outcomes
+                (alert_id, checked_at, horizon_minutes, price_at_check,
+                 future_return_pct, max_favorable_excursion, max_adverse_excursion,
+                 hit_tp1, hit_tp2, hit_stop, outcome)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                outcome["alert_id"],
+                outcome["checked_at"],
+                outcome["horizon_minutes"],
+                outcome.get("price_at_check", 0.0),
+                outcome.get("future_return_pct", 0.0),
+                outcome.get("max_favorable_excursion", 0.0),
+                outcome.get("max_adverse_excursion", 0.0),
+                int(outcome.get("hit_tp1", False)),
+                int(outcome.get("hit_tp2", False)),
+                int(outcome.get("hit_stop", False)),
+                outcome.get("outcome", "unknown"),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error al insertar alert_outcome")
+
+
+# ── Retención / limpieza ──────────────────────────────────────────────────
+
+def purge_old_snapshots() -> int:
+    """Elimina snapshots más viejos que SNAPSHOT_RETENTION_DAYS. Retorna filas eliminadas."""
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - SNAPSHOT_RETENTION_DAYS * 86400)
+        cur = conn.execute(
+            "DELETE FROM market_snapshots WHERE timestamp < ?", (cutoff,)
+        )
+        conn.commit()
+        deleted = cur.rowcount
+        if deleted > 0:
+            logger.info("Purga: %d snapshots eliminados (>%d días)", deleted, SNAPSHOT_RETENTION_DAYS)
+        return deleted
+    except Exception:
+        logger.exception("Error al purgar snapshots")
+        return 0
+
+
+# ── Dashboard queries ─────────────────────────────────────────────────────
+
+def get_recent_alerts(limit: int = 50) -> List[Dict[str, Any]]:
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT ta.*,
+                   ao.outcome, ao.hit_tp1, ao.hit_tp2, ao.hit_stop,
+                   ao.future_return_pct,
+                   GROUP_CONCAT(DISTINCT nl.channel) AS channels
+            FROM trade_alerts ta
+            LEFT JOIN alert_outcomes ao
+                ON ao.alert_id = ta.id AND ao.horizon_minutes = 60
+            LEFT JOIN notification_log nl
+                ON nl.alert_id = ta.id AND nl.ok = 1
+            GROUP BY ta.id
+            ORDER BY ta.timestamp DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener alertas recientes")
+        return []
+
+
+def get_winrate_summary(since_hours: float = 24.0) -> Dict[str, Any]:
+    """Resumen de win rate para enviar como reporte periódico.
+
+    Retorna:
+        {
+          "since_hours": 24,
+          "total_alerts": 12,
+          "by_action": [{"action", "total", "wins", "partials", "losses", "neutrals",
+                         "winrate_pct", "avg_return_pct", "avg_score"}, ...],
+          "top_symbols": [{"symbol", "action", "total", "wins", "winrate_pct"}, ...],
+          "global_winrate_pct": 58.3,
+          "global_avg_return_pct": 1.2,
+        }
+    """
+    empty: Dict[str, Any] = {
+        "since_hours": since_hours,
+        "total_alerts": 0,
+        "by_action": [],
+        "top_symbols": [],
+        "global_winrate_pct": 0.0,
+        "global_avg_return_pct": 0.0,
+    }
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+
+        by_action = conn.execute(
+            """
+            SELECT ta.action,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN ao.outcome = 'win'     THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN ao.outcome = 'partial' THEN 1 ELSE 0 END) AS partials,
+                   SUM(CASE WHEN ao.outcome = 'loss'    THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN ao.outcome IS NULL OR ao.outcome = 'neutral'
+                             THEN 1 ELSE 0 END) AS neutrals,
+                   AVG(ta.score) AS avg_score,
+                   AVG(CASE WHEN ao.outcome IN ('win','partial','loss')
+                            THEN MAX(-50.0, MIN(50.0, ao.future_return_pct))
+                            ELSE NULL END) AS avg_return_pct
+            FROM trade_alerts ta
+            LEFT JOIN alert_outcomes ao ON ao.alert_id = ta.id AND ao.horizon_minutes = 60
+            WHERE ta.timestamp >= ?
+            GROUP BY ta.action
+            ORDER BY total DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        top_symbols = conn.execute(
+            """
+            SELECT ta.symbol, ta.action,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
+                   ROUND(100.0 * SUM(CASE WHEN ao.outcome IN ('win','partial')
+                                          THEN 1 ELSE 0 END) / COUNT(*), 1) AS winrate_pct,
+                   AVG(ao.future_return_pct) AS avg_return_pct
+            FROM trade_alerts ta
+            LEFT JOIN alert_outcomes ao ON ao.alert_id = ta.id AND ao.horizon_minutes = 60
+            WHERE ta.timestamp >= ?
+            GROUP BY ta.symbol, ta.action
+            HAVING total >= 2
+            ORDER BY winrate_pct DESC, total DESC
+            LIMIT 5
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        rows_action = []
+        total_all = 0
+        total_wins_all = 0
+        total_partials_all = 0
+        total_evaluated_all = 0
+        returns_all: List[float] = []
+
+        for r in by_action:
+            total = r["total"] or 0
+            w     = r["wins"] or 0
+            p     = r["partials"] or 0
+            l     = r["losses"] or 0
+            n     = r["neutrals"] or 0
+            evaluated = w + p + l
+            strict_wr  = round(w / evaluated * 100.0, 1) if evaluated else 0.0
+            dir_wr     = round((w + p) / evaluated * 100.0, 1) if evaluated else 0.0
+            avg_ret = round(r["avg_return_pct"] or 0.0, 2)
+            rows_action.append({
+                "action":                  r["action"],
+                "total":                   total,
+                "wins":                    w,
+                "partials":                p,
+                "losses":                  l,
+                "neutrals":                n,
+                "evaluated":               evaluated,
+                "winrate_pct":             strict_wr,   # wins / evaluated
+                "directional_winrate_pct": dir_wr,      # (wins+partials) / evaluated
+                "avg_return_pct":          avg_ret,
+                "avg_score":               round(r["avg_score"] or 0.0, 1),
+            })
+            total_all           += total
+            total_wins_all      += w
+            total_partials_all  += p
+            total_evaluated_all += evaluated
+            if r["avg_return_pct"] is not None:
+                returns_all.append(r["avg_return_pct"])
+
+        global_wr  = round(total_wins_all / total_evaluated_all * 100.0, 1) if total_evaluated_all else 0.0
+        global_dir = round((total_wins_all + total_partials_all) / total_evaluated_all * 100.0, 1) if total_evaluated_all else 0.0
+        global_ret = round(sum(returns_all) / len(returns_all), 2) if returns_all else 0.0
+
+        return {
+            "since_hours":                  since_hours,
+            "total_alerts":                 total_all,
+            "total_evaluated":              total_evaluated_all,
+            "by_action":                    rows_action,
+            "top_symbols":                  [dict(r) for r in top_symbols],
+            "global_winrate_pct":           global_wr,
+            "global_directional_winrate_pct": global_dir,
+            "global_avg_return_pct":        global_ret,
+        }
+    except Exception:
+        logger.exception("Error al calcular winrate summary")
+        return empty
+
+
+def get_win_rate_by_action() -> List[Dict[str, Any]]:
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT ta.action,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
+                   AVG(ta.score) AS avg_score,
+                   AVG(ao.future_return_pct) AS avg_return_pct
+            FROM trade_alerts ta
+            LEFT JOIN alert_outcomes ao ON ao.alert_id=ta.id AND ao.horizon_minutes=60
+            GROUP BY ta.action
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al calcular win rate")
+        return []
+
+
+def get_symbols_by_action() -> List[Dict[str, Any]]:
+    """Top símbolos por tipo de acción con win rate individual."""
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT ta.action,
+                   ta.symbol,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
+                   AVG(ta.score) AS avg_score,
+                   AVG(ao.future_return_pct) AS avg_return_pct
+            FROM trade_alerts ta
+            LEFT JOIN alert_outcomes ao ON ao.alert_id = ta.id AND ao.horizon_minutes = 60
+            GROUP BY ta.action, ta.symbol
+            ORDER BY ta.action, total DESC
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener símbolos por acción")
+        return []
+
+
+def get_channel_stats() -> List[Dict[str, Any]]:
+    """Conteo de notificaciones enviadas por canal y tipo de acción."""
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            """
+            SELECT ta.action,
+                   nl.channel,
+                   COUNT(*) AS total_sent,
+                   SUM(CASE WHEN nl.ok = 1 THEN 1 ELSE 0 END) AS ok,
+                   SUM(CASE WHEN nl.ok = 0 THEN 1 ELSE 0 END) AS failed
+            FROM notification_log nl
+            JOIN trade_alerts ta ON ta.id = nl.alert_id
+            GROUP BY ta.action, nl.channel
+            ORDER BY ta.action, total_sent DESC
+            """,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener estadísticas de canales")
+        return []
+
+
+def get_snapshot_count() -> int:
+    try:
+        conn = _get_conn()
+        return conn.execute("SELECT COUNT(*) FROM market_snapshots").fetchone()[0]
+    except Exception:
+        return 0
+
+
+def get_latest_snapshots(limit: int = 60, max_age_seconds: int = 120) -> List[Dict[str, Any]]:
+    """Retorna el snapshot más reciente por símbolo, excluyendo los más viejos de max_age_seconds.
+
+    Usa MAX(id) para garantizar unicidad — dos inserts en el mismo segundo
+    comparten timestamp y causarían filas duplicadas con MAX(timestamp).
+    """
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - max_age_seconds)
+        rows = conn.execute(
+            """
+            SELECT ms.*
+            FROM market_snapshots ms
+            INNER JOIN (
+                SELECT symbol, MAX(id) AS max_id
+                FROM market_snapshots
+                WHERE timestamp >= ?
+                GROUP BY symbol
+            ) latest ON ms.id = latest.max_id
+            ORDER BY ms.score DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener últimos snapshots")
+        return []
+
+
+def get_scanner_freshness() -> Optional[str]:
+    """Retorna el timestamp del snapshot más reciente en la DB, o None si está vacía."""
+    try:
+        conn = _get_conn()
+        row = conn.execute(
+            "SELECT MAX(timestamp) FROM market_snapshots"
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+# ── Auto-trading positions ─────────────────────────────────────────────────
+
+def insert_auto_position(data: Dict[str, Any]) -> int:
+    conn = _get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO auto_positions
+            (alert_id, symbol, action, mode, open_time, entry_price, size_usdt,
+             leverage, tp1, tp2, sl, sl_current)
+        VALUES
+            (:alert_id, :symbol, :action, :mode, :open_time, :entry_price, :size_usdt,
+             :leverage, :tp1, :tp2, :sl, :sl_current)
+        """,
+        data,
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_open_auto_positions() -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM auto_positions WHERE status = 'open' ORDER BY open_time"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_auto_position_tp1(position_id: int, tp1_pnl_usdt: float, new_sl: float) -> None:
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE auto_positions SET tp1_hit=1, tp1_pnl_usdt=?, sl_current=? WHERE id=?",
+        (tp1_pnl_usdt, new_sl, position_id),
+    )
+    conn.commit()
+
+
+def close_auto_position(position_id: int, exit_price: float, close_reason: str,
+                        final_pnl_usdt: float, total_pnl_usdt: float,
+                        total_pnl_pct: float) -> None:
+    conn = _get_conn()
+    conn.execute(
+        """
+        UPDATE auto_positions SET
+            status         = 'closed',
+            close_time     = ?,
+            exit_price     = ?,
+            close_reason   = ?,
+            final_pnl_usdt = ?,
+            total_pnl_usdt = ?,
+            total_pnl_pct  = ?
+        WHERE id = ?
+        """,
+        (_now_iso(), exit_price, close_reason,
+         final_pnl_usdt, total_pnl_usdt, total_pnl_pct,
+         position_id),
+    )
+    conn.commit()
+
+
+def get_auto_positions_summary(since_hours: float = 24.0) -> Dict[str, Any]:
+    conn = _get_conn()
+    cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+    row = conn.execute(
+        """
+        SELECT
+            COUNT(*)                                                    AS total,
+            SUM(CASE WHEN close_reason = 'tp2'         THEN 1 ELSE 0 END) AS tp2_count,
+            SUM(CASE WHEN close_reason = 'tp1_only'    THEN 1 ELSE 0 END) AS tp1_count,
+            SUM(CASE WHEN close_reason IN ('sl','sl_breakeven') THEN 1 ELSE 0 END) AS sl_count,
+            SUM(CASE WHEN close_reason = 'timeout'     THEN 1 ELSE 0 END) AS timeout_count,
+            COALESCE(SUM(total_pnl_usdt), 0.0)                         AS total_pnl_usdt,
+            COALESCE(AVG(total_pnl_pct),  0.0)                         AS avg_pnl_pct
+        FROM auto_positions
+        WHERE status = 'closed' AND close_time >= ?
+        """,
+        (cutoff,),
+    ).fetchone()
+    return {
+        "total":         row["total"] or 0,
+        "tp2_count":     row["tp2_count"] or 0,
+        "tp1_count":     row["tp1_count"] or 0,
+        "sl_count":      row["sl_count"] or 0,
+        "timeout_count": row["timeout_count"] or 0,
+        "total_pnl_usdt": round(row["total_pnl_usdt"] or 0.0, 4),
+        "avg_pnl_pct":   round(row["avg_pnl_pct"] or 0.0, 2),
+        "total_pnl_pct": round((row["total_pnl_usdt"] or 0.0), 4),
+    }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
+
+def _ts_to_iso(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))

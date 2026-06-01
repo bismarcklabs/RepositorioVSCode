@@ -1,51 +1,63 @@
-import requests
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Literal
+
+from app import market_data
+
+_MarketType = Literal["spot", "futures"]
 
 
-def get_orderbook(symbol: str, limit: int = 20) -> Dict[str, Any]:
-    """Fetch the Binance order book depth for a symbol."""
-    url = "https://api.binance.com/api/v3/depth"
-    try:
-        response = requests.get(
-            url,
-            params={"symbol": symbol.upper(), "limit": limit},
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException:
-        return {"bids": [], "asks": []}
-
-
-def parse_orderbook_levels(levels: List[List[str]]) -> List[Tuple[float, float]]:
-    """Convert order book levels from strings to numeric price and quantity tuples."""
-    return [(float(price), float(qty)) for price, qty in levels]
-
-
-def calculate_book_volume(levels: List[List[str]]) -> float:
-    """Calculate total volume from a list of order book levels."""
+def _book_volume(levels: List[List[str]]) -> float:
     return sum(float(level[1]) for level in levels if len(level) >= 2)
 
 
-def get_orderbook_imbalance(symbol: str, limit: int = 20) -> Dict[str, Any]:
-    """Get order book bids/asks and calculate imbalance metric."""
-    orderbook = get_orderbook(symbol, limit=limit)
+def get_orderbook_imbalance(
+    symbol: str,
+    limit: int = 20,
+    market: _MarketType = "spot",
+) -> Dict[str, Any]:
+    """Calcula imbalance y spread del order book.
 
-    bids = orderbook.get("bids", [])
-    asks = orderbook.get("asks", [])
+    market="futures" usa el endpoint /fapi/v1/depth (más relevante para
+    acciones LONG_FUTURES / SHORT_FUTURES).
+    market="spot" usa /api/v3/depth (default, retrocompatible).
+    """
+    if market == "futures":
+        ob = market_data.get_futures_orderbook_raw(symbol, limit)
+    else:
+        ob = market_data.get_orderbook_raw(symbol, limit)
 
-    bid_volume = calculate_book_volume(bids)
-    ask_volume = calculate_book_volume(asks)
+    bids = ob.get("bids", [])
+    asks = ob.get("asks", [])
 
-    imbalance = 0.0
-    if bid_volume + ask_volume != 0:
-        imbalance = (bid_volume - ask_volume) / (bid_volume + ask_volume)
+    if not bids and not asks:
+        return {
+            "symbol": symbol.upper(),
+            "bids": [],
+            "asks": [],
+            "bid_volume": 0.0,
+            "ask_volume": 0.0,
+            "imbalance": 0.0,
+            "spread_pct": 999.0,
+            "orderbook_available": False,
+        }
+
+    bid_vol = _book_volume(bids)
+    ask_vol = _book_volume(asks)
+
+    imbalance = (
+        (bid_vol - ask_vol) / (bid_vol + ask_vol) if bid_vol + ask_vol > 0 else 0.0
+    )
+
+    best_bid = float(bids[0][0]) if bids else 0.0
+    best_ask = float(asks[0][0]) if asks else 0.0
+    spread_pct = (best_ask - best_bid) / best_bid * 100.0 if best_bid > 0.0 else 999.0
 
     return {
         "symbol": symbol.upper(),
         "bids": bids,
         "asks": asks,
-        "bid_volume": round(bid_volume, 8),
-        "ask_volume": round(ask_volume, 8),
+        "bid_volume": round(bid_vol, 8),
+        "ask_volume": round(ask_vol, 8),
         "imbalance": round(imbalance, 8),
+        "spread_pct": round(spread_pct, 6),
+        "orderbook_available": True,
     }
