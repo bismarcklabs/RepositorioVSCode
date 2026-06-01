@@ -81,6 +81,7 @@ def build_trade_recommendation(
     alert_report: Optional[Dict[str, Any]] = None,
     volume_profile: Optional[Dict[str, Any]] = None,
     gex_data: Optional[Dict[str, Any]] = None,
+    multi_exchange_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     score = score_data.get("score", 0)
     warnings = list(score_data.get("warnings", []))
@@ -151,6 +152,45 @@ def build_trade_recommendation(
 
     if action == "WAIT" and risk_level == "high":
         warnings.append("Riesgo alto detectado — entrada directa descartada")
+
+    # ── Ajuste por confirmación multi-exchange ────────────────────────────
+    # Solo actúa cuando hay datos externos (external_supported=True).
+    # Para altcoins (external_supported=False o mx_conf=None): sin ajuste,
+    # sin warning — no penalizar por ausencia de dato externo.
+    if action != "WAIT" and multi_exchange_data and multi_exchange_data.get("ok"):
+        if multi_exchange_data.get("external_supported"):
+            mx_conf  = multi_exchange_data.get("multi_exchange_confidence")
+            mx_dev   = multi_exchange_data.get("price_deviation_pct")
+            mx_warns = multi_exchange_data.get("warnings", [])
+
+            if mx_conf is not None:
+                if mx_conf < 50:
+                    # Confirmación externa débil: bajar confianza 5 pts
+                    confidence = max(40, confidence - 5)
+                    dev_str = f" / divergencia {mx_dev:.3f}%" if mx_dev else ""
+                    warnings.append(
+                        f"Confirmacion externa baja: {mx_conf:.0f}%{dev_str}"
+                    )
+                elif mx_conf >= 80:
+                    # Confirmación sólida: agregar como razón positiva
+                    reasons.append(
+                        f"Confirmacion multi-exchange: {mx_conf:.0f}%"
+                    )
+
+                # Divergencia de precio llamativa (independiente del tier de confianza)
+                if mx_dev is not None and mx_dev > 0.50:
+                    warnings.append(
+                        f"Divergencia de precio entre exchanges: {mx_dev:.3f}% — validar entrada"
+                    )
+
+            # Propagar advertencias del aggregator que no estén ya cubiertas
+            for w in mx_warns:
+                already_covered = any(
+                    existing.startswith(w[:30]) or w.startswith(existing[:30])
+                    for existing in warnings
+                )
+                if not already_covered:
+                    warnings.append(w)
 
     # ── Calcular niveles operables ────────────────────────────────────────
     setup: Optional[Dict[str, Any]] = None

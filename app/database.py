@@ -71,9 +71,21 @@ def _migrate_schema() -> None:
         ("market_snapshots", "risk_penalty",         "INTEGER DEFAULT 0"),
         ("market_snapshots", "confluence_score",     "INTEGER DEFAULT 0"),
         # contexto completo serializado (para reconstruir la UI desde DB)
-        ("market_snapshots", "recommendation_json",  "TEXT DEFAULT '{}'"),
-        ("market_snapshots", "signal_json",          "TEXT DEFAULT '{}'"),
-        ("market_snapshots", "alert_report_json",    "TEXT DEFAULT '{}'"),
+        ("market_snapshots", "recommendation_json",          "TEXT DEFAULT '{}'"),
+        ("market_snapshots", "signal_json",                  "TEXT DEFAULT '{}'"),
+        ("market_snapshots", "alert_report_json",            "TEXT DEFAULT '{}'"),
+        # multi-exchange confirmation (Phase 5/6)
+        ("market_snapshots", "multi_exchange_score",         "INTEGER DEFAULT 0"),
+        ("market_snapshots", "multi_exchange_confidence",    "REAL"),
+        ("market_snapshots", "price_deviation_pct",          "REAL"),
+        ("market_snapshots", "exchange_availability_score",  "REAL"),
+        # setup evaluation + ML
+        ("market_snapshots", "setup_valid",                  "INTEGER DEFAULT 0"),
+        ("market_snapshots", "setup_grade",                  "TEXT DEFAULT ''"),
+        ("market_snapshots", "setup_score",                  "INTEGER DEFAULT 0"),
+        ("market_snapshots", "trigger_type",                 "TEXT DEFAULT ''"),
+        ("market_snapshots", "ml_probability",               "REAL"),
+        ("market_snapshots", "ml_filtered",                  "INTEGER DEFAULT 0"),
     ]
     for table, col, col_def in new_columns:
         try:
@@ -244,6 +256,45 @@ def init_db() -> None:
                     ON auto_positions(status);
                 CREATE INDEX IF NOT EXISTS idx_autopos_symbol
                     ON auto_positions(symbol, status);
+
+                -- Ticker por exchange externo (Coinbase, Kraken) por ciclo
+                CREATE TABLE IF NOT EXISTS exchange_market_snapshots (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,           -- normalizado: "BTC"
+                    binance_symbol  TEXT    NOT NULL,           -- "BTCUSDT"
+                    exchange        TEXT    NOT NULL,           -- "coinbase" | "kraken"
+                    exchange_symbol TEXT    NOT NULL DEFAULT '', -- "BTC-USD" | "XBT/USD"
+                    price           REAL,
+                    bid             REAL,
+                    ask             REAL,
+                    spread_pct      REAL,
+                    volume_24h      REAL,
+                    ok              INTEGER DEFAULT 1,
+                    error           TEXT    DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_exsnap_sym_ts
+                    ON exchange_market_snapshots(binance_symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_exsnap_ts
+                    ON exchange_market_snapshots(timestamp);
+
+                -- Métricas agregadas por símbolo soportado por ciclo
+                CREATE TABLE IF NOT EXISTS multi_exchange_metrics (
+                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp                   TEXT    NOT NULL,
+                    symbol                      TEXT    NOT NULL,
+                    binance_symbol              TEXT    NOT NULL,
+                    binance_price               REAL,
+                    coinbase_price              REAL,
+                    kraken_price                REAL,
+                    price_deviation_pct         REAL,
+                    exchange_availability_score REAL,
+                    multi_exchange_confidence   REAL,
+                    multi_exchange_score        INTEGER DEFAULT 0,
+                    warnings_json               TEXT    DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_mexmetrics_sym_ts
+                    ON multi_exchange_metrics(binance_symbol, timestamp);
             """)
             conn.commit()
             _migrate_schema()
@@ -267,6 +318,7 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
     metrics = data.get("metrics") or {}
     ob = data.get("orderbook") or {}
     sd = data.get("score_data") or {}
+    mx = data.get("multi_exchange") or {}
 
     return (
         ts,
@@ -345,6 +397,19 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
         json.dumps(rec),
         json.dumps(data.get("signal") or {}),
         json.dumps(data.get("alert_report") or {}),
+        # multi-exchange
+        sd.get("multi_exchange_score", 0),
+        mx.get("multi_exchange_confidence"),       # None para altcoins
+        mx.get("price_deviation_pct"),             # None para altcoins
+        mx.get("exchange_availability_score"),
+        # setup evaluation
+        int(bool((data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("valid", False))),
+        (data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("grade", ""),
+        int((data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("score", 0)),
+        (data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("trigger_type") or "",
+        # ml
+        data.get("ml_probability"),
+        int(rec.get("action") == "WAIT" and data.get("ml_probability") is not None),
     )
 
 
@@ -366,7 +431,11 @@ _SNAPSHOT_INSERT = """
         cvd_15m, atr, atr_pct, htf_trend_bias, rsi, oi_change_pct,
         flow_score, technical_score, volume_profile_score, footprint_score,
         futures_score, risk_penalty, confluence_score,
-        recommendation_json, signal_json, alert_report_json
+        recommendation_json, signal_json, alert_report_json,
+        multi_exchange_score, multi_exchange_confidence,
+        price_deviation_pct, exchange_availability_score,
+        setup_valid, setup_grade, setup_score, trigger_type,
+        ml_probability, ml_filtered
     ) VALUES (
         ?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,
@@ -378,7 +447,9 @@ _SNAPSHOT_INSERT = """
         ?,?,?,
         ?,?,?,?,?,?,
         ?,?,?,?,?,?,?,
-        ?,?,?
+        ?,?,?,
+        ?,?,?,?,
+        ?,?,?,?,?,?
     )
 """
 
@@ -572,6 +643,132 @@ def insert_alert_outcome(outcome: Dict[str, Any]) -> None:
         logger.exception("Error al insertar alert_outcome")
 
 
+# ── Multi-exchange persistence ────────────────────────────────────────────
+
+_EXSNAP_INSERT = """
+    INSERT INTO exchange_market_snapshots
+        (timestamp, symbol, binance_symbol, exchange, exchange_symbol,
+         price, bid, ask, spread_pct, volume_24h, ok, error)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+_MEXMETRICS_INSERT = """
+    INSERT INTO multi_exchange_metrics
+        (timestamp, symbol, binance_symbol, binance_price,
+         coinbase_price, kraken_price, price_deviation_pct,
+         exchange_availability_score, multi_exchange_confidence,
+         multi_exchange_score, warnings_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+
+def insert_multi_exchange_batch(records: List[Dict[str, Any]]) -> None:
+    """Persiste datos externos (Coinbase, Kraken) para símbolos soportados.
+
+    Solo inserta cuando el símbolo tiene soporte externo Y score >= SNAPSHOT_MIN_SCORE.
+    Binance no se guarda aquí (ya está en market_snapshots).
+    """
+    if not records:
+        return
+
+    supported = [
+        r for r in records
+        if (r.get("score_data") or {}).get("score", 0) >= SNAPSHOT_MIN_SCORE
+        and (r.get("multi_exchange") or {}).get("external_supported")
+    ]
+    if not supported:
+        return
+
+    exsnap_rows: List[Tuple] = []
+    mexmet_rows: List[Tuple] = []
+    ts = _now_iso()
+
+    for r in supported:
+        mx      = r["multi_exchange"]
+        bsym    = r["symbol"]
+        tickers = mx.get("exchanges", {})
+
+        # Extraer precio de cada exchange externo
+        cb_price = kr_price = None
+
+        for ex_name, ticker in tickers.items():
+            if ex_name == "binance":
+                continue
+            ok    = int(bool(ticker.ok))
+            price = ticker.price
+            if ex_name == "coinbase":
+                cb_price = price
+            elif ex_name == "kraken":
+                kr_price = price
+
+            exsnap_rows.append((
+                ts,
+                ticker.normalized_symbol,
+                bsym,
+                ex_name,
+                ticker.symbol or "",
+                price,
+                ticker.bid,
+                ticker.ask,
+                ticker.spread_pct,
+                ticker.volume_24h,
+                ok,
+                ticker.error or "",
+            ))
+
+        # Una fila por símbolo con métricas agregadas
+        mexmet_rows.append((
+            ts,
+            tickers.get("binance", type("", (), {"normalized_symbol": bsym.replace("USDT", "")})()).normalized_symbol
+            if "binance" in tickers else bsym.replace("USDT", ""),
+            bsym,
+            mx.get("primary_price"),
+            cb_price,
+            kr_price,
+            mx.get("price_deviation_pct"),
+            mx.get("exchange_availability_score"),
+            mx.get("multi_exchange_confidence"),
+            (r.get("score_data") or {}).get("multi_exchange_score", 0),
+            json.dumps(mx.get("warnings", [])),
+        ))
+
+    try:
+        conn = _get_conn()
+        if exsnap_rows:
+            conn.executemany(_EXSNAP_INSERT, exsnap_rows)
+        if mexmet_rows:
+            conn.executemany(_MEXMETRICS_INSERT, mexmet_rows)
+        conn.commit()
+        logger.debug(
+            "Multi-exchange: %d tickers externos, %d metricas insertadas",
+            len(exsnap_rows), len(mexmet_rows),
+        )
+    except Exception:
+        logger.exception("Error al insertar datos multi-exchange")
+
+
+def get_multi_exchange_history(
+    binance_symbol: str,
+    hours: float = 24.0,
+) -> List[Dict[str, Any]]:
+    """Retorna historial de métricas multi-exchange para un símbolo."""
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - hours * 3600)
+        rows = conn.execute(
+            """
+            SELECT * FROM multi_exchange_metrics
+            WHERE binance_symbol = ? AND timestamp >= ?
+            ORDER BY timestamp DESC
+            """,
+            (binance_symbol.upper(), cutoff),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener historial multi-exchange para %s", binance_symbol)
+        return []
+
+
 # ── Retención / limpieza ──────────────────────────────────────────────────
 
 def purge_old_snapshots() -> int:
@@ -582,6 +779,9 @@ def purge_old_snapshots() -> int:
         cur = conn.execute(
             "DELETE FROM market_snapshots WHERE timestamp < ?", (cutoff,)
         )
+        # Purgar también tablas multi-exchange con la misma retención
+        conn.execute("DELETE FROM exchange_market_snapshots WHERE timestamp < ?", (cutoff,))
+        conn.execute("DELETE FROM multi_exchange_metrics WHERE timestamp < ?", (cutoff,))
         conn.commit()
         deleted = cur.rowcount
         if deleted > 0:

@@ -425,6 +425,47 @@ def _risk_penalty(
     return min(penalty, 30), warnings   # cap en 30
 
 
+# ── Multi-exchange confirmation ───────────────────────────────────────────
+
+def _multi_exchange_score(
+    multi_ex: Optional[Dict[str, Any]],
+) -> Tuple[int, List[str]]:
+    """Confirmación cruzada Coinbase + Kraken. Máx +5, mín -18.
+
+    None = altcoin sin soporte externo → 0 pts, sin penalización.
+    La lógica None-neutral es crítica: no penalizar altcoins por ausencia de dato.
+    """
+    if not multi_ex or not multi_ex.get("ok"):
+        return 0, []
+
+    conf = multi_ex.get("multi_exchange_confidence")
+    dev  = multi_ex.get("price_deviation_pct")
+
+    if conf is None:
+        return 0, []  # altcoin sin cobertura externa — neutral
+
+    pts: int = 0
+    reasons: List[str] = []
+
+    avail = multi_ex.get("exchange_availability_score", 100)
+
+    if conf >= 80:
+        pts += 5
+        reasons.append(f"Confirmacion multi-exchange: {conf:.0f}% ({avail:.0f}% disponibilidad)")
+    elif conf >= 60:
+        pts += 2
+        reasons.append(f"Confirmacion multi-exchange moderada: {conf:.0f}%")
+    elif conf < 50:
+        pts -= 10
+        reasons.append(f"Divergencia entre exchanges: confianza {conf:.0f}%")
+
+    if dev is not None and dev > 0.35:
+        pts -= 8
+        reasons.append(f"Divergencia de precio entre exchanges: {dev:.3f}%")
+
+    return pts, reasons
+
+
 # ── Score compuesto público ───────────────────────────────────────────────
 
 def calculate_opportunity_score(
@@ -444,6 +485,7 @@ def calculate_opportunity_score(
     oi_change_pct: float = 0.0,
     # Kept for backwards compat — no longer used in scoring
     volume_24h: float = 0.0,
+    multi_exchange_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     flow_pts, flow_r = _flow_score(signal, metrics, imbalance, liquidation_summary)
     tech_pts, tech_r = _technical_score(technical, signal)
@@ -452,11 +494,12 @@ def calculate_opportunity_score(
     fut_pts, fut_r = _futures_score(signal, funding, open_interest, liquidation_summary, oi_change_pct)
     gex_pts, gex_r = _gex_score(gex_data, signal, price)
     bk_pts, bk_r  = _breakout_score(technical, metrics, signal)
+    mx_pts, mx_r  = _multi_exchange_score(multi_exchange_data)
     penalty, warnings = _risk_penalty(signal, funding, spread_pct, technical, breakout_pts=bk_pts)
 
-    raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts - penalty
+    raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts + mx_pts - penalty
     score = max(0, min(100, raw))
-    reasons = (flow_r + tech_r + vp_r + fp_r + fut_r + gex_r + bk_r)[:8]
+    reasons = (flow_r + tech_r + vp_r + fp_r + fut_r + gex_r + bk_r + mx_r)[:8]
 
     return {
         "score": score,
@@ -467,6 +510,7 @@ def calculate_opportunity_score(
         "futures_score": fut_pts,
         "gex_score": gex_pts,
         "breakout_score": bk_pts,
+        "multi_exchange_score": mx_pts,
         "risk_penalty": penalty,
         "reasons": reasons,
         "warnings": warnings,

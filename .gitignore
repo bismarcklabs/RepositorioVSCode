@@ -1,19 +1,26 @@
-venv/
-__pycache__/
-*.pyc
-.env
-.env.local
-.DS_Store
-
-# Database & data
-data/*.sqlite3
-data/*.db
-data/*.csv
+﻿# Base de datos y modelos ML
+data/
 
 # Logs
-logs/*.log
-logs/*.log.*
+logs/
 
-# IDE
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Variables de entorno reales (solo .env.example se sube)
+.env
+
+# Editores
 .vscode/
 .idea/
+*.swp
+*.swo

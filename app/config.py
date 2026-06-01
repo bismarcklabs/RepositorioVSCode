@@ -76,6 +76,24 @@ AUTO_TRADING_TIER3_SCORE   = int(os.getenv("AUTO_TRADING_TIER3_SCORE", "70"))   
 # Intervalo del reporte de posiciones a Telegram (segundos)
 POSITION_REPORT_INTERVAL_SECONDS = int(os.getenv("POSITION_REPORT_INTERVAL_SECONDS", "600"))
 
+# ── Machine Learning (filtro de probabilidad de TP1) ─────────────────────
+ML_ENABLED       = os.getenv("ML_ENABLED", "false").lower() == "true"
+ML_THRESHOLD     = float(os.getenv("ML_THRESHOLD", "0.52"))       # prob mínima para no filtrar
+ML_MODEL_PATH    = os.getenv("ML_MODEL_PATH", "data/ml_model.pkl")
+ML_MIN_SAMPLES   = int(os.getenv("ML_MIN_SAMPLES", "50"))         # muestras mínimas para entrenar
+
+# ── Setup evaluation (sistema de decisión disciplinado) ───────────────────
+ENABLE_PRICE_ACTION_TRIGGER = os.getenv("ENABLE_PRICE_ACTION_TRIGGER", "true").lower() == "true"
+ENABLE_SETUP_EVALUATION     = os.getenv("ENABLE_SETUP_EVALUATION",     "true").lower() == "true"
+# IMPORTANTE: empieza en false — calcula y guarda sin bloquear alertas actuales
+ENABLE_SETUP_GATE           = os.getenv("ENABLE_SETUP_GATE",           "false").lower() == "true"
+SETUP_MIN_SCORE             = int(os.getenv("SETUP_MIN_SCORE", "70"))
+SETUP_ALERT_GRADES: set = {
+    x.strip().upper()
+    for x in os.getenv("SETUP_ALERT_GRADES", "A,B").split(",")
+    if x.strip()
+}
+
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"
 SMTP_HOST = os.getenv("SMTP_HOST", "")

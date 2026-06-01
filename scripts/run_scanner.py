@@ -42,6 +42,10 @@ from app.config import (
     WINRATE_REPORT_ENABLED,
     WINRATE_REPORT_INTERVAL_HOURS,
     WINRATE_REPORT_WINDOW_HOURS,
+    ENABLE_PRICE_ACTION_TRIGGER,
+    ENABLE_SETUP_EVALUATION,
+    ENABLE_SETUP_GATE,
+    SETUP_ALERT_GRADES,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -65,6 +69,10 @@ from app.report_sender import send_winrate_report
 from app.auto_trader import evaluate_alert as auto_evaluate
 from app.position_monitor import check_positions, send_positions_report
 from app.config import AUTO_TRADING_ENABLED, POSITION_REPORT_INTERVAL_SECONDS
+from app.exchanges.aggregator import get_multi_exchange_snapshot
+from app.ml_predictor import predictor as ml_predictor
+from app.price_action import detect_price_action_trigger
+from app.setup_rules import evaluate_trade_setup
 
 _GEX_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
@@ -212,7 +220,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
                 for t in raw
             ]
 
-        with ThreadPoolExecutor(max_workers=9) as ex:
+        with ThreadPoolExecutor(max_workers=11) as ex:
             f_funding       = ex.submit(market_data.get_funding, symbol)
             f_oi            = ex.submit(market_data.get_open_interest, symbol)
             f_ob_spot       = ex.submit(get_orderbook_imbalance, symbol, 20, "spot")
@@ -222,16 +230,20 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             f_fp            = ex.submit(get_footprint, symbol)
             f_futures_price = ex.submit(market_data.get_futures_price, symbol)
             f_spot_price    = ex.submit(market_data.get_spot_price, symbol)
+            f_multi_ex      = ex.submit(get_multi_exchange_snapshot, symbol)
+            f_klines_1m     = ex.submit(market_data.get_klines, symbol, "1m", 50)
 
-        funding          = f_funding.result()
-        oi               = f_oi.result()
-        ob_spot          = f_ob_spot.result()
-        ob_futures       = f_ob_fut.result()
-        technical        = f_technical.result()
-        vp               = f_vp.result()
-        fp               = f_fp.result()
+        funding           = f_funding.result()
+        oi                = f_oi.result()
+        ob_spot           = f_ob_spot.result()
+        ob_futures        = f_ob_fut.result()
+        technical         = f_technical.result()
+        vp                = f_vp.result()
+        fp                = f_fp.result()
         futures_price_raw = f_futures_price.result()
-        price            = f_spot_price.result()
+        price             = f_spot_price.result()
+        multi_ex          = f_multi_ex.result()
+        klines_1m         = f_klines_1m.result()
         orderbook_data   = ob_futures if ob_futures.get("orderbook_available") else ob_spot
 
         gex: Optional[Dict] = None
@@ -274,6 +286,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             footprint_data=fp,
             gex_data=gex,
             oi_change_pct=oi_change_pct,
+            multi_exchange_data=multi_ex,
         )
 
         recommendation = build_trade_recommendation(
@@ -287,33 +300,80 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             alert_report=alert_report if alert_report else None,
             volume_profile=vp,
             gex_data=gex,
+            multi_exchange_data=multi_ex,
         )
+
+        # ── Price action trigger (paralelo — klines ya recuperados) ──────────
+        trigger: Optional[Dict] = None
+        if ENABLE_PRICE_ACTION_TRIGGER:
+            try:
+                trigger = detect_price_action_trigger(
+                    klines_1m,
+                    vwap=technical.get("vwap"),
+                )
+            except Exception:
+                logger.debug("[%s] price action trigger no disponible", symbol)
+
+        # ── Evaluación de setup (solo cuando hay señal accionable) ────────────
+        setup_eval = None
+        if ENABLE_SETUP_EVALUATION and recommendation.get("action") != "WAIT":
+            try:
+                setup_eval = evaluate_trade_setup(
+                    action=recommendation["action"],
+                    technical=technical,
+                    metrics=metrics,
+                    footprint=fp,
+                    volume_profile=vp,
+                    gex_data=gex,
+                    setup=recommendation.get("setup"),
+                    trigger=trigger,
+                    multi_exchange=multi_ex,
+                )
+                recommendation["setup_evaluation"] = setup_eval.to_dict()
+
+                # Gate: bloquea alerta si grade no califica
+                # (ENABLE_SETUP_GATE=false por defecto — no bloquea hasta validar)
+                if ENABLE_SETUP_GATE and recommendation.get("action") != "WAIT":
+                    if not setup_eval.valid or setup_eval.grade not in SETUP_ALERT_GRADES:
+                        recommendation.setdefault("warnings", []).append(
+                            f"Setup bloqueado: grado={setup_eval.grade}, score={setup_eval.score}"
+                        )
+                        recommendation["action"] = "WAIT"
+                        recommendation["market"] = "NONE"
+            except Exception:
+                logger.debug("[%s] setup evaluation falló", symbol)
+
+        result = {
+            "symbol":          symbol.upper(),
+            "timestamp":       time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "price":           price,
+            "futures_price":   futures_price,
+            "metrics":         metrics,
+            "funding":         funding,
+            "open_interest":   oi,
+            "orderbook":       orderbook_data,
+            "ob_spot":         ob_spot,
+            "ob_futures":      ob_futures,
+            "signal":          signal_data,
+            "technical":       technical,
+            "score_data":      score_data,
+            "recommendation":  recommendation,
+            "volume_profile":  vp,
+            "footprint":       fp,
+            "gex":             gex,
+            "liquidations":    liquidations,
+            "alert_report":    alert_report,
+            "oi_change_pct":   oi_change_pct,
+            "multi_exchange":  multi_ex,
+            "trigger":         trigger,
+            "setup_evaluation": setup_eval.to_dict() if setup_eval else None,
+        }
+
+        ml_predictor.apply_filter(result)
 
         elapsed = time.monotonic() - t0
         logger.debug("[%s] %.1fs score=%d action=%s", symbol, elapsed, score_data["score"], recommendation["action"])
-
-        return {
-            "symbol":         symbol.upper(),
-            "timestamp":      time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
-            "price":          price,
-            "futures_price":  futures_price,
-            "metrics":        metrics,
-            "funding":        funding,
-            "open_interest":  oi,
-            "orderbook":      orderbook_data,
-            "ob_spot":        ob_spot,
-            "ob_futures":     ob_futures,
-            "signal":         signal_data,
-            "technical":      technical,
-            "score_data":     score_data,
-            "recommendation": recommendation,
-            "volume_profile": vp,
-            "footprint":      fp,
-            "gex":            gex,
-            "liquidations":   liquidations,
-            "alert_report":   alert_report,
-            "oi_change_pct":  oi_change_pct,
-        }
+        return result
     except Exception:
         logger.exception("[%s] error en pipeline", symbol)
         return None
@@ -349,6 +409,7 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
 
     if ENABLE_DATABASE:
         database.insert_snapshots_batch(results)
+        database.insert_multi_exchange_batch(results)
         logger.info("Snapshots insertados: %d", len(results))
 
     actionable = [r for r in results if r["recommendation"]["action"] != "WAIT"]
@@ -380,6 +441,8 @@ def main() -> None:
     if ENABLE_DATABASE:
         database.init_db()
         _init_cooldown_from_db()
+
+    ml_predictor.load()
 
     start_ws_background()
     if ENABLE_LIQUIDATIONS:
