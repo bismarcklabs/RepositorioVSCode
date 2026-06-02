@@ -7,7 +7,7 @@ Distribución de puntos (total: ~105 teórico, efectivo 100 con cap):
     footprint_score     15  — absorción, stacked imbalance, delta
     futures_score       15  — OI, funding, liquidaciones de futuros
     gex_score            5  — niveles gamma (BTC/ETH, opcional)
-    risk_penalty        -30 — máximo posible de penalización
+    risk_penalty        -45 — máximo posible de penalización
 
 Resultado: max(0, min(100, raw - penalty))
 """
@@ -369,8 +369,9 @@ def _risk_penalty(
     spread_pct: float,
     technical: Dict[str, Any],
     breakout_pts: int = 0,
+    metrics: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, List[str]]:
-    """Penalización por factores de riesgo. Máx -30 pts."""
+    """Penalización por factores de riesgo. Máx -45 pts."""
     penalty = 0
     warnings: List[str] = []
 
@@ -422,7 +423,51 @@ def _risk_penalty(
         penalty += 5
         warnings.append(f"RSI sobrevendido ({rsi:.1f}) — señal bajista puede estar agotada")
 
-    return min(penalty, 30), warnings   # cap en 30
+    # ── Sobreextensión del precio vs VWAP 1h ─────────────────────────────────
+    # Precio muy alejado del VWAP intradiario indica momentum agotado, no breakout sano.
+    # El VWAP de technical_context usa las últimas 60 velas de 1m (= 1 hora).
+    vwap_dist = technical.get("vwap_distance_pct", 0.0)
+    if bullish and vwap_dist >= 25:
+        penalty += 12
+        warnings.append(f"Precio sobreextendido sobre VWAP 1h: +{vwap_dist:.1f}% — riesgo de reversión elevado")
+    elif bullish and vwap_dist >= 12:
+        penalty += 6
+        warnings.append(f"Precio alejado de VWAP 1h: +{vwap_dist:.1f}%")
+    elif bearish and vwap_dist <= -25:
+        penalty += 12
+        warnings.append(f"Precio sobreextendido bajo VWAP 1h: {vwap_dist:.1f}% — rebote posible")
+    elif bearish and vwap_dist <= -12:
+        penalty += 6
+        warnings.append(f"Precio alejado de VWAP 1h: {vwap_dist:.1f}%")
+
+    # ── Divergencia CVD/precio ────────────────────────────────────────────────
+    # Precio subiendo pero CVD 15m negativo = venta institucional en fuerza (distribución silenciosa).
+    # Precio bajando pero CVD 15m positivo = compra institucional en debilidad (acumulación silenciosa).
+    if metrics:
+        cvd_15m = metrics.get("cvd_15m", 0.0)
+        return_15m = technical.get("return_15m", 0.0)
+        if bullish and return_15m >= 2.0 and cvd_15m < 0:
+            penalty += 8
+            warnings.append(
+                f"Divergencia bajista: precio +{return_15m:.1f}% en 15m pero CVD 15m negativo ({cvd_15m:.0f})"
+            )
+        elif bearish and return_15m <= -2.0 and cvd_15m > 0:
+            penalty += 8
+            warnings.append(
+                f"Divergencia alcista: precio {return_15m:.1f}% en 15m pero CVD 15m positivo ({cvd_15m:.0f})"
+            )
+
+    # ── Trade aglomerado por funding extremo direccional ──────────────────────
+    # Cuando el funding es extremo EN LA DIRECCIÓN DE LA SEÑAL, el trade está
+    # masivamente aglomerado — cualquier reversión se amplifica por liquidaciones en cadena.
+    if bullish and funding >= EXTREME_FUNDING_ABS * 3:
+        penalty += 10
+        warnings.append(f"Trade long aglomerado — funding muy positivo ({funding:.5f}), squeeze de largos inminente")
+    elif bearish and funding <= -EXTREME_FUNDING_ABS * 3:
+        penalty += 10
+        warnings.append(f"Trade short aglomerado — funding muy negativo ({funding:.5f}), squeeze de cortos inminente")
+
+    return min(penalty, 45), warnings   # cap aumentado a 45
 
 
 # ── Multi-exchange confirmation ───────────────────────────────────────────
@@ -495,7 +540,7 @@ def calculate_opportunity_score(
     gex_pts, gex_r = _gex_score(gex_data, signal, price)
     bk_pts, bk_r  = _breakout_score(technical, metrics, signal)
     mx_pts, mx_r  = _multi_exchange_score(multi_exchange_data)
-    penalty, warnings = _risk_penalty(signal, funding, spread_pct, technical, breakout_pts=bk_pts)
+    penalty, warnings = _risk_penalty(signal, funding, spread_pct, technical, breakout_pts=bk_pts, metrics=metrics)
 
     raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts + mx_pts - penalty
     score = max(0, min(100, raw))

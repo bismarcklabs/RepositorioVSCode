@@ -64,8 +64,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ── Auto-trading ──────────────────────────────────────────────────────────
 AUTO_TRADING_ENABLED       = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
 AUTO_TRADING_MODE          = os.getenv("AUTO_TRADING_MODE", "paper")          # paper | real
-AUTO_TRADING_CAPITAL_USDT  = float(os.getenv("AUTO_TRADING_CAPITAL_USDT", "1000"))
-AUTO_TRADING_MAX_POSITIONS = int(os.getenv("AUTO_TRADING_MAX_POSITIONS", "3"))
+AUTO_TRADING_CAPITAL_USDT  = float(os.getenv("AUTO_TRADING_CAPITAL_USDT", "100"))
+AUTO_TRADING_MAX_POSITIONS = int(os.getenv("AUTO_TRADING_MAX_POSITIONS", "5"))
 AUTO_TRADING_MARKETS       = os.getenv("AUTO_TRADING_MARKETS", "futures")     # futures | spot | both
 AUTO_TRADING_MIN_SCORE     = int(os.getenv("AUTO_TRADING_MIN_SCORE", "70"))
 AUTO_TRADING_TIMEOUT_HOURS = float(os.getenv("AUTO_TRADING_TIMEOUT_HOURS", "4"))

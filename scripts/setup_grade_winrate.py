@@ -25,7 +25,7 @@ from app.config import DATABASE_PATH
 
 _GRADE_QUERY = """
 SELECT
-    COALESCE(NULLIF(ms.setup_grade, ''), 'sin_grade') AS grade,
+    COALESCE(NULLIF(ta.setup_grade, ''), 'sin_grade') AS grade,
     COUNT(*)                                           AS total,
     SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
     SUM(CASE WHEN ao.outcome = 'win'              THEN 1 ELSE 0 END) AS strict_wins,
@@ -37,14 +37,6 @@ JOIN alert_outcomes ao
     ON ao.alert_id = ta.id
     AND ao.horizon_minutes = ?
     AND ao.outcome IN ('win', 'partial', 'loss')
-JOIN market_snapshots ms
-    ON ms.id = (
-        SELECT ms2.id FROM market_snapshots ms2
-        WHERE ms2.symbol = ta.symbol
-          AND ms2.timestamp <= ta.timestamp
-        ORDER BY ms2.timestamp DESC
-        LIMIT 1
-    )
 GROUP BY grade
 ORDER BY
     CASE grade
@@ -60,7 +52,7 @@ ORDER BY
 
 _TRIGGER_QUERY = """
 SELECT
-    COALESCE(NULLIF(ms.trigger_type, ''), 'sin_gatillo') AS trigger,
+    COALESCE(NULLIF(ta.trigger_type, ''), 'sin_gatillo') AS trigger,
     COUNT(*)                                              AS total,
     SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
     ROUND(AVG(ao.future_return_pct), 2)                   AS avg_return_pct
@@ -69,14 +61,6 @@ JOIN alert_outcomes ao
     ON ao.alert_id = ta.id
     AND ao.horizon_minutes = ?
     AND ao.outcome IN ('win', 'partial', 'loss')
-JOIN market_snapshots ms
-    ON ms.id = (
-        SELECT ms2.id FROM market_snapshots ms2
-        WHERE ms2.symbol = ta.symbol
-          AND ms2.timestamp <= ta.timestamp
-        ORDER BY ms2.timestamp DESC
-        LIMIT 1
-    )
 GROUP BY trigger
 ORDER BY total DESC
 """
@@ -86,7 +70,7 @@ ORDER BY total DESC
 _ACTION_GRADE_QUERY = """
 SELECT
     ta.action,
-    COALESCE(NULLIF(ms.setup_grade, ''), 'sin_grade') AS grade,
+    COALESCE(NULLIF(ta.setup_grade, ''), 'sin_grade') AS grade,
     COUNT(*)  AS total,
     SUM(CASE WHEN ao.outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
     ROUND(AVG(ao.future_return_pct), 2) AS avg_return_pct
@@ -95,14 +79,6 @@ JOIN alert_outcomes ao
     ON ao.alert_id = ta.id
     AND ao.horizon_minutes = ?
     AND ao.outcome IN ('win', 'partial', 'loss')
-JOIN market_snapshots ms
-    ON ms.id = (
-        SELECT ms2.id FROM market_snapshots ms2
-        WHERE ms2.symbol = ta.symbol
-          AND ms2.timestamp <= ta.timestamp
-        ORDER BY ms2.timestamp DESC
-        LIMIT 1
-    )
 GROUP BY ta.action, grade
 ORDER BY ta.action, grade
 """
@@ -135,18 +111,14 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
 
-    # ── Verificar que las columnas nuevas existen ─────────────────────────
-    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(market_snapshots)").fetchall()}
-    required = {"setup_grade", "setup_score", "trigger_type", "ml_probability", "ml_filtered"}
+    # ── Verificar que las columnas existen en trade_alerts ───────────────
+    existing_cols = {r[1] for r in conn.execute("PRAGMA table_info(trade_alerts)").fetchall()}
+    required = {"setup_grade", "trigger_type"}
     missing = required - existing_cols
     if missing:
-        print(f"[!] Columnas aun no migradas: {missing}")
-        print("    Ejecuta el scanner una vez para aplicar la migracion automatica:")
-        print("    .\\venv\\Scripts\\python.exe scripts\\run_scanner.py --interval 15 --limit 5")
-        print()
-        print("    O aplica la migracion manualmente:")
-        print("    .\\venv\\Scripts\\python.exe -c \"")
-        print("    from app.database import init_db; init_db()\"")
+        print(f"[!] Columnas aun no migradas en trade_alerts: {missing}")
+        print("    Aplica la migracion ejecutando:")
+        print("    .\\venv\\Scripts\\python.exe -c \"from app.database import init_db; init_db()\"")
         conn.close()
         sys.exit(0)
 

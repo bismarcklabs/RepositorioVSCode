@@ -25,6 +25,10 @@ from app.config import (
     ENABLE_TELEGRAM_ALERTS,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    ENABLE_SETUP_GATE,
+    SETUP_ALERT_GRADES,
+    ML_ENABLED,
+    ML_THRESHOLD,
 )
 
 logger = logging.getLogger("auto_trader")
@@ -118,6 +122,19 @@ def _passes_gates(result: Dict[str, Any],
     size = get_position_size_usdt(score)
     if size <= 0:
         return False, f"score {score} no alcanza ningun tier de sizing"
+
+    # Gate de setup grade — usa el mismo flag que controla el scanner
+    if ENABLE_SETUP_GATE:
+        grade = rec.get("setup_evaluation", {}).get("grade", "")
+        if grade not in SETUP_ALERT_GRADES:
+            return False, f"setup grade '{grade or 'sin_grade'}' no califica ({SETUP_ALERT_GRADES})"
+
+    # Gate de probabilidad ML — bloquea directo si prob está bajo el umbral duro
+    # Más preciso que esperar que apply_filter degrade action a WAIT
+    if ML_ENABLED:
+        ml_prob = result.get("ml_probability")
+        if ml_prob is not None and ml_prob < ML_THRESHOLD * 0.85:
+            return False, f"ML prob={ml_prob:.2f} < umbral duro ({ML_THRESHOLD * 0.85:.2f})"
 
     return True, ""
 

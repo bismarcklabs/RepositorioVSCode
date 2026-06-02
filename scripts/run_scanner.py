@@ -86,6 +86,72 @@ _MIN_SCORE_BY_ACTION: Dict[str, int] = {
 # cooldown state: key = "SYMBOL:ACTION", value = (last_sent_epoch, last_confidence)
 _cooldown: Dict[str, Tuple[float, int]] = {}
 
+# ── Filtro de estancamiento ────────────────────────────────────────────────
+# Detecta cuando el scanner repite alertas en la misma zona de precio sin que
+# el precio avance (distribución silenciosa / techo gradual).
+# key = "SYMBOL:long" | "SYMBOL:short"  value = {anchor, count}
+_stag_zones: Dict[str, Dict] = {}
+
+_STAG_ZONE_WIDTH_PCT  = 1.0   # ±1% del precio ancla = misma zona
+_STAG_RESET_PCT       = 1.5   # precio avanza +1.5% → breakout, resetear zona
+_STAG_MIN_COUNT       = 3     # suprimir desde la 3ª alerta en zona sin TP1 previo
+
+
+def _stag_check(symbol: str, action: str, price: float) -> Tuple[bool, str]:
+    """Retorna (suprimir, motivo).
+
+    suprimir=True cuando hay ≥3 alertas consecutivas en la misma zona de precio
+    sin que ninguna alerta anterior haya tocado TP1 (precio no avanza).
+    Se resetea automáticamente cuando el precio supera +1.5% el techo de zona.
+    """
+    is_long  = action in ("LONG_FUTURES", "BUY_SPOT")
+    is_short = action in ("SHORT_FUTURES", "SELL_SPOT")
+    if not (is_long or is_short):
+        return False, ""
+
+    key   = f"{symbol}:{'long' if is_long else 'short'}"
+    state = _stag_zones.get(key)
+
+    if state is None:
+        _stag_zones[key] = {"anchor": price, "count": 1}
+        return False, ""
+
+    anchor = state["anchor"]
+    dist   = (price - anchor) / anchor * 100   # + = por encima del ancla
+
+    # Breakout / breakdown: precio rompió la zona → nueva zona, siempre enviar
+    if is_long  and dist >  _STAG_RESET_PCT:
+        _stag_zones[key] = {"anchor": price, "count": 1}
+        logger.debug("STAG RESET %s long: breakout +%.1f%% → nueva zona $%.4f", symbol, dist, price)
+        return False, ""
+    if is_short and dist < -_STAG_RESET_PCT:
+        _stag_zones[key] = {"anchor": price, "count": 1}
+        logger.debug("STAG RESET %s short: breakdown %.1f%% → nueva zona $%.4f", symbol, dist, price)
+        return False, ""
+
+    # Precio fuera de la zona (±1%) pero sin breakout → nueva zona
+    if abs(dist) > _STAG_ZONE_WIDTH_PCT:
+        _stag_zones[key] = {"anchor": price, "count": 1}
+        return False, ""
+
+    # Precio dentro de la zona: incrementar contador
+    state["count"] += 1
+    count = state["count"]
+
+    if count < _STAG_MIN_COUNT:
+        return False, ""
+
+    # count >= 3: verificar si alguna alerta previa en esta zona tocó TP1
+    tp1_hits = database.get_zone_tp1_hits(symbol, action, anchor)
+    if tp1_hits > 0:
+        logger.debug("STAG ALLOW %s: zona activa pero %d TP1 previo(s) → tendencia real", symbol, tp1_hits)
+        return False, ""
+
+    return (
+        True,
+        f"alerta #{count} en zona ${anchor:.4f}±{_STAG_ZONE_WIDTH_PCT}% sin TP1 previo",
+    )
+
 
 def _init_cooldown_from_db() -> None:
     """Pre-popula el cooldown desde trade_alerts de las últimas 24h (ok=1 Y ok=0).
@@ -167,15 +233,21 @@ def _process_alert(result: Dict[str, Any]) -> None:
     key = f"{symbol}:{action}"
     _cooldown[key] = (time.time(), conf)
 
+    setup_eval_dict = result.get("setup_evaluation") or {}
     alert_id: Optional[int] = database.insert_trade_alert({
-        "timestamp":  result.get("timestamp", ""),
-        "symbol":     symbol,
-        "action":     action,
-        "market":     market,
-        "confidence": conf,
-        "score":      score,
-        "price":      price,
-        "setup":      setup,
+        "timestamp":    result.get("timestamp", ""),
+        "symbol":       symbol,
+        "action":       action,
+        "market":       market,
+        "confidence":   conf,
+        "score":        score,
+        "price":        price,
+        "setup":        setup,
+        "setup_grade":  setup_eval_dict.get("grade", ""),
+        "setup_score":  setup_eval_dict.get("score", 0),
+        "trigger_type": (result.get("trigger") or {}).get("type", ""),
+        "ml_probability": result.get("ml_probability"),
+        "ml_filtered":  result.get("ml_filtered", False),
     })
 
     logger.info(
@@ -422,10 +494,17 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
             r["symbol"], action, score, conf, r["signal"]["signal"],
         )
         if ENABLE_DATABASE and _should_send_alert(r["symbol"], action, score, conf):
-            try:
-                _process_alert(r)
-            except Exception:
-                logger.exception("Error procesando alerta %s", r["symbol"])
+            suppress, stag_reason = _stag_check(r["symbol"], action, r.get("price", 0.0))
+            if suppress:
+                logger.info(
+                    "STAGNATION SKIP %-12s | %s | %s",
+                    r["symbol"], action, stag_reason,
+                )
+            else:
+                try:
+                    _process_alert(r)
+                except Exception:
+                    logger.exception("Error procesando alerta %s", r["symbol"])
 
     return results
 

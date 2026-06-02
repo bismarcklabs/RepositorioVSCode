@@ -86,6 +86,12 @@ def _migrate_schema() -> None:
         ("market_snapshots", "trigger_type",                 "TEXT DEFAULT ''"),
         ("market_snapshots", "ml_probability",               "REAL"),
         ("market_snapshots", "ml_filtered",                  "INTEGER DEFAULT 0"),
+        # setup/ML en trade_alerts para sobrevivir la purga de snapshots
+        ("trade_alerts", "setup_grade",    "TEXT DEFAULT ''"),
+        ("trade_alerts", "setup_score",    "INTEGER DEFAULT 0"),
+        ("trade_alerts", "trigger_type",   "TEXT DEFAULT ''"),
+        ("trade_alerts", "ml_probability", "REAL"),
+        ("trade_alerts", "ml_filtered",    "INTEGER DEFAULT 0"),
     ]
     for table, col, col_def in new_columns:
         try:
@@ -487,8 +493,11 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
             INSERT INTO trade_alerts
                 (timestamp, symbol, action, market, confidence, score,
                  price, entry, stop_loss, take_profit_1, take_profit_2,
-                 risk_reward_1, risk_reward_2, status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+                 risk_reward_1, risk_reward_2,
+                 setup_grade, setup_score, trigger_type,
+                 ml_probability, ml_filtered,
+                 status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
             """,
             (
                 data.get("timestamp", ""),
@@ -504,6 +513,11 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
                 setup.get("take_profit_2", 0.0),
                 setup.get("risk_reward_1", 0.0),
                 setup.get("risk_reward_2", 0.0),
+                data.get("setup_grade", ""),
+                data.get("setup_score", 0),
+                data.get("trigger_type", ""),
+                data.get("ml_probability"),
+                int(data.get("ml_filtered", False)),
             ),
         )
         conn.commit()
@@ -767,6 +781,40 @@ def get_multi_exchange_history(
     except Exception:
         logger.exception("Error al obtener historial multi-exchange para %s", binance_symbol)
         return []
+
+
+# ── Filtro de estancamiento ───────────────────────────────────────────────
+
+def get_zone_tp1_hits(symbol: str, action: str, anchor_price: float,
+                      lookback_hours: float = 8.0) -> int:
+    """Alertas en zona ±1.5% del precio ancla que tocaron TP1 en las últimas N horas.
+
+    Usado por el filtro de estancamiento para distinguir breakouts reales
+    (donde TP1 se toca) de distribución silenciosa (donde no avanza).
+    """
+    is_long = action in ("LONG_FUTURES", "BUY_SPOT")
+    actions = ("LONG_FUTURES", "BUY_SPOT") if is_long else ("SHORT_FUTURES", "SELL_SPOT")
+    placeholders = ",".join("?" * len(actions))
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - lookback_hours * 3600)
+        row = conn.execute(
+            f"""
+            SELECT COUNT(*) FROM trade_alerts ta
+            JOIN alert_outcomes ao
+                ON ao.alert_id = ta.id AND ao.horizon_minutes = 60
+            WHERE ta.symbol = ?
+              AND ta.action IN ({placeholders})
+              AND ta.timestamp >= ?
+              AND ao.hit_tp1 = 1
+              AND ABS(ta.price - ?) / ? * 100 <= 1.5
+            """,
+            (symbol, *actions, cutoff, anchor_price, anchor_price),
+        ).fetchone()
+        return row[0] if row else 0
+    except Exception:
+        logger.exception("Error en get_zone_tp1_hits para %s", symbol)
+        return 0
 
 
 # ── Retención / limpieza ──────────────────────────────────────────────────
