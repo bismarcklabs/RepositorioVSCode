@@ -541,7 +541,13 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
             if result:
                 results.append(result)
 
-    results.sort(key=lambda x: x["score_data"]["score"], reverse=True)
+    results.sort(
+        key=lambda x: (
+            x["score_data"]["score"]
+            + min(20, x.get("trend_priority_score", 0) * 0.20)
+        ),
+        reverse=True,
+    )
 
     if ENABLE_DATABASE:
         database.insert_snapshots_batch(results)

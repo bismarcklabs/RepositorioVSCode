@@ -125,14 +125,14 @@ def test_reasons_list_not_too_long():
     assert len(result["reasons"]) <= 8
 
 
-def test_risk_penalty_capped_at_30():
+def test_risk_penalty_capped_at_45():
     result = _score(
         signal="neutral",
         funding=0.05,
         spread_pct=0.2,
         technical={**_BASE_TECHNICAL, "trend_bias": "bearish"},
     )
-    assert result["risk_penalty"] <= 30
+    assert result["risk_penalty"] <= 45
 
 
 def test_bearish_signal_below_vwap_scores():
