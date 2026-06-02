@@ -94,6 +94,14 @@ SETUP_ALERT_GRADES: set = {
     if x.strip()
 }
 
+# ── Trend continuation (segunda vía de alerta sin gatillo clásico) ────────
+# Activa detección de tendencias fuertes sostenidas (JTO/STG/WLD style).
+# Empieza en true para observar — sin bloqueo hasta que ENABLE_SETUP_GATE=true.
+ENABLE_TREND_CONTINUATION           = os.getenv("ENABLE_TREND_CONTINUATION",           "true").lower() == "true"
+TREND_CONTINUATION_MIN_SCORE        = int(os.getenv("TREND_CONTINUATION_MIN_SCORE",     "75"))
+TREND_CONTINUATION_MIN_PERSISTENCE  = int(os.getenv("TREND_CONTINUATION_MIN_PERSISTENCE", "3"))
+TREND_CONTINUATION_LOOKBACK         = int(os.getenv("TREND_CONTINUATION_LOOKBACK",      "10"))
+
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"
 SMTP_HOST = os.getenv("SMTP_HOST", "")

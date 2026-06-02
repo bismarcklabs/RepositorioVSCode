@@ -14,6 +14,7 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,10 @@ from app.config import (
     ENABLE_SETUP_EVALUATION,
     ENABLE_SETUP_GATE,
     SETUP_ALERT_GRADES,
+    ENABLE_TREND_CONTINUATION,
+    TREND_CONTINUATION_MIN_SCORE,
+    TREND_CONTINUATION_MIN_PERSISTENCE,
+    TREND_CONTINUATION_LOOKBACK,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -73,6 +78,11 @@ from app.exchanges.aggregator import get_multi_exchange_snapshot
 from app.ml_predictor import predictor as ml_predictor
 from app.price_action import detect_price_action_trigger
 from app.setup_rules import evaluate_trade_setup
+from app.trend_continuation import (
+    is_long_momentum_continuation,
+    is_short_momentum_continuation,
+    calculate_trend_priority_score,
+)
 
 _GEX_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
@@ -95,6 +105,14 @@ _stag_zones: Dict[str, Dict] = {}
 _STAG_ZONE_WIDTH_PCT  = 1.0   # ±1% del precio ancla = misma zona
 _STAG_RESET_PCT       = 1.5   # precio avanza +1.5% → breakout, resetear zona
 _STAG_MIN_COUNT       = 3     # suprimir desde la 3ª alerta en zona sin TP1 previo
+
+# ── Historia de momentum en memoria ───────────────────────────────────────
+# key = "SYMBOL:long" | "SYMBOL:short"
+# Cada entrada es True/False (si ese ciclo cumplió continuación).
+# maxlen = TREND_CONTINUATION_LOOKBACK (10 por defecto)
+_momentum_history: Dict[str, deque] = defaultdict(
+    lambda: deque(maxlen=TREND_CONTINUATION_LOOKBACK)
+)
 
 
 def _stag_check(symbol: str, action: str, price: float) -> Tuple[bool, str]:
@@ -245,9 +263,11 @@ def _process_alert(result: Dict[str, Any]) -> None:
         "setup":        setup,
         "setup_grade":  setup_eval_dict.get("grade", ""),
         "setup_score":  setup_eval_dict.get("score", 0),
-        "trigger_type": (result.get("trigger") or {}).get("type", ""),
+        "trigger_type": setup_eval_dict.get("trigger_type") or (result.get("trigger") or {}).get("type", ""),
         "ml_probability": result.get("ml_probability"),
         "ml_filtered":  result.get("ml_filtered", False),
+        "setup_route":  setup_eval_dict.get("setup_route", ""),
+        "trend_priority_score": result.get("trend_priority_score", 0),
     })
 
     logger.info(
@@ -386,12 +406,49 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             except Exception:
                 logger.debug("[%s] price action trigger no disponible", symbol)
 
+        # ── Continuación de tendencia (siempre calculado, ambas direcciones) ───
+        snap_for_cont = {"technical": technical, "metrics": metrics, "funding": funding}
+        is_long_cont  = is_long_momentum_continuation(snap_for_cont)
+        is_short_cont = is_short_momentum_continuation(snap_for_cont)
+
+        _momentum_history[f"{symbol}:long"].append(is_long_cont)
+        _momentum_history[f"{symbol}:short"].append(is_short_cont)
+
+        action_cur     = recommendation.get("action", "WAIT")
+        is_long_action = action_cur in ("LONG_FUTURES", "BUY_SPOT")
+        is_short_action = action_cur in ("SHORT_FUTURES", "SELL_SPOT")
+
+        if is_long_action:
+            cont_val, cont_dir = is_long_cont, "long"
+        elif is_short_action:
+            cont_val, cont_dir = is_short_cont, "short"
+        else:
+            cont_val, cont_dir = False, "long"
+
+        trend_data        = calculate_trend_priority_score(snap_for_cont, cont_dir)
+        trend_score       = trend_data["trend_priority_score"]
+        persistence_count = sum(_momentum_history[f"{symbol}:{cont_dir}"])
+
+        trend_continuation_valid = (
+            ENABLE_TREND_CONTINUATION
+            and cont_val
+            and persistence_count >= TREND_CONTINUATION_MIN_PERSISTENCE
+            and trend_score >= TREND_CONTINUATION_MIN_SCORE
+            and action_cur != "WAIT"
+        )
+
+        if trend_continuation_valid:
+            logger.debug(
+                "[%s] TREND CONT %s — score=%d persist=%d/%d",
+                symbol, cont_dir, trend_score, persistence_count, TREND_CONTINUATION_LOOKBACK,
+            )
+
         # ── Evaluación de setup (solo cuando hay señal accionable) ────────────
         setup_eval = None
-        if ENABLE_SETUP_EVALUATION and recommendation.get("action") != "WAIT":
+        if ENABLE_SETUP_EVALUATION and action_cur != "WAIT":
             try:
                 setup_eval = evaluate_trade_setup(
-                    action=recommendation["action"],
+                    action=action_cur,
                     technical=technical,
                     metrics=metrics,
                     footprint=fp,
@@ -400,6 +457,8 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
                     setup=recommendation.get("setup"),
                     trigger=trigger,
                     multi_exchange=multi_ex,
+                    trend_continuation_valid=trend_continuation_valid,
+                    trend_priority_score=trend_score,
                 )
                 recommendation["setup_evaluation"] = setup_eval.to_dict()
 
@@ -439,6 +498,11 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             "multi_exchange":  multi_ex,
             "trigger":         trigger,
             "setup_evaluation": setup_eval.to_dict() if setup_eval else None,
+            # trend continuation
+            "trend_priority_score":       trend_score,
+            "momentum_continuation":      cont_val,
+            "momentum_persistence_count": persistence_count,
+            "trend_continuation_valid":   trend_continuation_valid,
         }
 
         ml_predictor.apply_filter(result)

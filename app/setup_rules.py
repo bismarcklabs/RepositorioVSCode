@@ -23,6 +23,7 @@ class SetupEvaluation:
     score: int                    # 0-100
     direction: str                # long | short | neutral
     trigger_type: Optional[str]   # tipo de gatillo o None
+    setup_route: str              # classic_trigger | momentum_continuation | none
     reasons: List[str]
     warnings: List[str]
     checklist: Dict[str, bool]
@@ -42,8 +43,15 @@ def evaluate_trade_setup(
     setup: Optional[Dict[str, Any]],
     trigger: Optional[Dict[str, Any]],
     multi_exchange: Optional[Dict[str, Any]] = None,
+    trend_continuation_valid: bool = False,
+    trend_priority_score: int = 0,
 ) -> SetupEvaluation:
-    """Evalúa el setup completo y retorna un SetupEvaluation con grado A/B/C/NO_TRADE."""
+    """Evalúa el setup completo y retorna un SetupEvaluation con grado A/B/C/NO_TRADE.
+
+    Dos rutas de calificación:
+    - classic_trigger: gatillo de price action (engulfing / rechazo / VWAP reclaim)
+    - momentum_continuation: tendencia fuerte sostenida sin gatillo clásico
+    """
 
     is_long  = action in {"LONG_FUTURES", "BUY_SPOT"}
     is_short = action in {"SHORT_FUTURES", "SELL_SPOT"}
@@ -129,14 +137,28 @@ def evaluate_trade_setup(
     trigger_type_str  = (trigger or {}).get("type", "")
     trigger_strength  = int((trigger or {}).get("strength", 0))
 
+    setup_route = "none"
+
     if is_long and trigger_direction == "long":
         checklist["trigger_ok"] = True
+        setup_route = "classic_trigger"
         score += 15
         reasons.append(f"Gatillo alcista: {trigger_type_str} (fuerza {trigger_strength}).")
     elif is_short and trigger_direction == "short":
         checklist["trigger_ok"] = True
+        setup_route = "classic_trigger"
         score += 15
         reasons.append(f"Gatillo bajista: {trigger_type_str} (fuerza {trigger_strength}).")
+    elif trend_continuation_valid:
+        # Ruta alternativa: tendencia fuerte y persistente sustituye al gatillo clásico
+        checklist["trigger_ok"] = True
+        setup_route = "momentum_continuation"
+        score += 12   # ligeramente menos que un gatillo clásico (+15)
+        trigger_type_str = "momentum_continuation"
+        reasons.append(
+            f"Continuación de tendencia: CVD, VWAP, HTF y momentum alineados "
+            f"(trend_score={trend_priority_score})."
+        )
     else:
         warnings.append("Sin gatillo claro de price action.")
 
@@ -196,6 +218,7 @@ def evaluate_trade_setup(
         score=score,
         direction="long" if is_long else "short" if is_short else "neutral",
         trigger_type=trigger_type_str or None,
+        setup_route=setup_route,
         reasons=reasons,
         warnings=warnings,
         checklist=checklist,

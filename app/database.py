@@ -92,6 +92,14 @@ def _migrate_schema() -> None:
         ("trade_alerts", "trigger_type",   "TEXT DEFAULT ''"),
         ("trade_alerts", "ml_probability", "REAL"),
         ("trade_alerts", "ml_filtered",    "INTEGER DEFAULT 0"),
+        # trend continuation
+        ("market_snapshots", "trend_priority_score",       "INTEGER DEFAULT 0"),
+        ("market_snapshots", "momentum_continuation",      "INTEGER DEFAULT 0"),
+        ("market_snapshots", "momentum_persistence_count", "INTEGER DEFAULT 0"),
+        ("market_snapshots", "setup_route",                "TEXT DEFAULT ''"),
+        # trend continuation en trade_alerts (sobrevive purga de 7 días)
+        ("trade_alerts", "setup_route",          "TEXT DEFAULT ''"),
+        ("trade_alerts", "trend_priority_score", "INTEGER DEFAULT 0"),
     ]
     for table, col, col_def in new_columns:
         try:
@@ -416,6 +424,11 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
         # ml
         data.get("ml_probability"),
         int(rec.get("action") == "WAIT" and data.get("ml_probability") is not None),
+        # trend continuation
+        data.get("trend_priority_score", 0),
+        int(bool(data.get("momentum_continuation", False))),
+        data.get("momentum_persistence_count", 0),
+        (data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("setup_route") or "",
     )
 
 
@@ -441,7 +454,9 @@ _SNAPSHOT_INSERT = """
         multi_exchange_score, multi_exchange_confidence,
         price_deviation_pct, exchange_availability_score,
         setup_valid, setup_grade, setup_score, trigger_type,
-        ml_probability, ml_filtered
+        ml_probability, ml_filtered,
+        trend_priority_score, momentum_continuation,
+        momentum_persistence_count, setup_route
     ) VALUES (
         ?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,
@@ -455,7 +470,8 @@ _SNAPSHOT_INSERT = """
         ?,?,?,?,?,?,?,
         ?,?,?,
         ?,?,?,?,
-        ?,?,?,?,?,?
+        ?,?,?,?,?,?,
+        ?,?,?,?
     )
 """
 
@@ -496,8 +512,9 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
                  risk_reward_1, risk_reward_2,
                  setup_grade, setup_score, trigger_type,
                  ml_probability, ml_filtered,
+                 setup_route, trend_priority_score,
                  status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
             """,
             (
                 data.get("timestamp", ""),
@@ -518,6 +535,8 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
                 data.get("trigger_type", ""),
                 data.get("ml_probability"),
                 int(data.get("ml_filtered", False)),
+                data.get("setup_route", ""),
+                data.get("trend_priority_score", 0),
             ),
         )
         conn.commit()
