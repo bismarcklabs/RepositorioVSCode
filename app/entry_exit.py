@@ -5,9 +5,12 @@ Retorna None si no hay setup válido (sin stop o sin TP1 calculable).
 """
 from typing import Any, Dict, List, Optional
 
-# Distancias mínimas de SL para evitar stops demasiado ajustados por ATR de 1m
-_MIN_SL_PCT_FUTURES = 0.015   # 1.5% mínimo para futuros (absorbe ruido de altcoins)
-_MIN_SL_PCT_SPOT    = 0.010   # 1.0% mínimo para spot
+# Distancias mínimas de SL para evitar stops demasiado ajustados por ATR de 1m.
+# Con 5x leverage, 1.5% → 7.5% riesgo efectivo — demasiado para un trade que
+# con TP1 a 1.5R queda con R:R casi 1:1 cuando el precio deriva.
+# Aumentado a 2.0% para garantizar que hay espacio real entre ruido y señal.
+_MIN_SL_PCT_FUTURES = 0.020   # 2.0% mínimo para futuros
+_MIN_SL_PCT_SPOT    = 0.012   # 1.2% mínimo para spot
 
 # R:R mínimo para TPs — 1:1 no justifica la operativa
 _MIN_TP1_RR = 1.5   # TP1 al menos 1.5R

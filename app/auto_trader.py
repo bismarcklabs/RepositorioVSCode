@@ -29,7 +29,9 @@ from app.config import (
     SETUP_ALERT_GRADES,
     ML_ENABLED,
     ML_THRESHOLD,
+    BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE,
 )
+from app.market_regime import is_countertrend_action
 
 logger = logging.getLogger("auto_trader")
 
@@ -75,6 +77,34 @@ _DIRECTION = {
 }
 
 
+def _levels_are_valid(action: str, entry: float,
+                      tp1: Optional[float], tp2: Optional[float],
+                      sl: float) -> Tuple[bool, str]:
+    """Evita abrir trades con TP/SL calculados contra otro precio base."""
+    if entry <= 0 or sl <= 0:
+        return False, "entry/sl invalidos"
+
+    if action in ("LONG_FUTURES", "BUY_SPOT"):
+        if sl >= entry:
+            return False, f"SL {sl:.6g} no esta debajo de entry {entry:.6g}"
+        if tp1 is not None and tp1 <= entry:
+            return False, f"TP1 {tp1:.6g} no esta encima de entry {entry:.6g}"
+        if tp2 is not None and tp2 < (tp1 or entry):
+            ref = tp1 if tp1 is not None else entry
+            return False, f"TP2 {tp2:.6g} no es >= referencia {ref:.6g}"
+
+    if action in ("SHORT_FUTURES", "SELL_SPOT"):
+        if sl <= entry:
+            return False, f"SL {sl:.6g} no esta encima de entry {entry:.6g}"
+        if tp1 is not None and tp1 >= entry:
+            return False, f"TP1 {tp1:.6g} no esta debajo de entry {entry:.6g}"
+        if tp2 is not None and tp2 > (tp1 or entry):
+            ref = tp1 if tp1 is not None else entry
+            return False, f"TP2 {tp2:.6g} no es <= referencia {ref:.6g}"
+
+    return True, ""
+
+
 def get_position_size_usdt(score: int) -> float:
     """Sizing variable según score: 80+→3%, 75-79→2%, 70-74→1%."""
     if score >= AUTO_TRADING_TIER1_SCORE:
@@ -104,6 +134,14 @@ def _passes_gates(result: Dict[str, Any],
 
     if score < AUTO_TRADING_MIN_SCORE:
         return False, f"score {score} < min {AUTO_TRADING_MIN_SCORE}"
+
+    regime = result.get("market_regime") or rec.get("market_regime") or {}
+    if regime.get("active") and is_countertrend_action(action, regime):
+        if score < BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE:
+            return (
+                False,
+                f"{regime.get('regime')} activo: {action} bloqueado por ir contra BTC",
+            )
 
     if conf < 60:
         return False, f"confianza {conf}% < 60%"
@@ -170,6 +208,34 @@ def evaluate_alert(result: Dict[str, Any],
         tp1       = setup.get("take_profit_1") or None
         tp2       = setup.get("take_profit_2") or None
         sl        = float(setup["stop_loss"])
+
+        # Reescalar TP/SL al precio real de entrada si difiere del precio del setup.
+        # El setup calcula niveles con un precio de referencia que puede estar
+        # desactualizado cuando la alerta llega al auto-trader → el R:R colapsa
+        # porque TP1 ya está cerca mientras SL queda lejos en términos relativos.
+        setup_entry = float(setup.get("entry") or entry_price)
+        if setup_entry > 0 and abs(entry_price - setup_entry) / setup_entry > 0.001:
+            sl_dist  = (sl  - setup_entry) / setup_entry          # negativo para long
+            tp1_dist = ((tp1 or 0) - setup_entry) / setup_entry   # positivo para long
+            tp2_dist = ((tp2 or 0) - setup_entry) / setup_entry   # positivo para long
+            sl  = round(entry_price * (1.0 + sl_dist),  8)
+            tp1 = round(entry_price * (1.0 + tp1_dist), 8) if tp1 else None
+            tp2 = round(entry_price * (1.0 + tp2_dist), 8) if tp2 else None
+            logger.debug(
+                "AUTO RESCALE %s %s: setup_entry=%.6g → fill=%.6g (%.2f%%) "
+                "sl=%.6g tp1=%s tp2=%s",
+                action, result["symbol"], setup_entry, entry_price,
+                (entry_price - setup_entry) / setup_entry * 100,
+                sl, f"{tp1:.6g}" if tp1 else "—", f"{tp2:.6g}" if tp2 else "—",
+            )
+
+        levels_ok, levels_reason = _levels_are_valid(action, entry_price, tp1, tp2, sl)
+        if not levels_ok:
+            logger.warning(
+                "AUTO SKIP %s %s: niveles incoherentes | %s",
+                action, result["symbol"], levels_reason,
+            )
+            return None
 
         position_id = database.insert_auto_position({
             "alert_id":    alert_id,
