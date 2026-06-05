@@ -187,6 +187,16 @@ def detect_micro_scalp(
     if price <= 0 or open_interest <= 0:
         return {"action": "WAIT", "score": 0, "confidence": 0}
 
+    # Gate de calidad de datos: si delta==0 el WebSocket no tiene historial real de trades
+    # para este símbolo (ej. XMR no tiene aggTrades en el stream). Las señales de delta,
+    # CVD y footprint_delta serían ruido — el micro-scalp no es confiable.
+    delta      = float(metrics.get("delta",          0.0) or 0.0)
+    fp_delta   = float((footprint or {}).get("footprint_delta", 0.0) or 0.0)
+    cvd_15m    = float(metrics.get("cvd_15m",        0.0) or 0.0)
+    if delta == 0.0 and fp_delta == 0.0 and abs(cvd_15m) < 100:
+        return {"action": "WAIT", "score": 0, "confidence": 0,
+                "warnings": ["Sin datos de flujo real (delta=0) — micro-scalp desactivado para este símbolo"]}
+
     long_score, long_reasons, long_warnings = calculate_micro_scalp_score(
         "long", technical, metrics, footprint, orderbook, funding, oi_change_pct, multi_ex
     )

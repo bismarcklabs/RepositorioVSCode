@@ -51,12 +51,16 @@ from app.config import (
     TREND_CONTINUATION_MIN_SCORE,
     TREND_CONTINUATION_MIN_PERSISTENCE,
     TREND_CONTINUATION_LOOKBACK,
+    MICRO_SCALP_ENABLED,
+    MICRO_SCALP_ALERT_COOLDOWN_SECONDS,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
 from app.indicators import calculate_metrics, update_open_interest
 from app.liquidations import get_liquidations, start_liquidation_ws
 from app.market_scanner import get_candidate_symbols, get_top_symbols
+from app.market_regime import detect_btc_market_regime
+from app.micro_scalper import detect_micro_scalp
 from app.orderbook import get_orderbook_imbalance
 from app.scoring import calculate_opportunity_score
 from app.signals import detect_institutional_signal
@@ -68,9 +72,10 @@ from app.websocket_client import (
     set_stream_symbols,
     start_ws_background,
 )
-from app.notifier import dispatch_alert
+from app.notifier import dispatch_alert, dispatch_micro_scalp_alert
 from app.outcome_tracker import run_outcome_tracker
-from app.report_sender import send_winrate_report
+from app.micro_outcome_tracker import run_micro_outcome_tracker
+from app.report_sender import send_winrate_report, send_micro_scalp_report
 from app.auto_trader import evaluate_alert as auto_evaluate
 from app.position_monitor import check_positions, send_positions_report
 from app.config import AUTO_TRADING_ENABLED, POSITION_REPORT_INTERVAL_SECONDS
@@ -95,6 +100,7 @@ _MIN_SCORE_BY_ACTION: Dict[str, int] = {
 
 # cooldown state: key = "SYMBOL:ACTION", value = (last_sent_epoch, last_confidence)
 _cooldown: Dict[str, Tuple[float, int]] = {}
+_micro_cooldown: Dict[str, float] = {}
 
 # ── Filtro de estancamiento ────────────────────────────────────────────────
 # Detecta cuando el scanner repite alertas en la misma zona de precio sin que
@@ -169,6 +175,25 @@ def _stag_check(symbol: str, action: str, price: float) -> Tuple[bool, str]:
         True,
         f"alerta #{count} en zona ${anchor:.4f}±{_STAG_ZONE_WIDTH_PCT}% sin TP1 previo",
     )
+
+
+def _should_send_micro_alert(symbol: str, action: str) -> bool:
+    key = f"{symbol}:{action}"
+    now = time.time()
+    last = _micro_cooldown.get(key, 0.0)
+    if now - last < MICRO_SCALP_ALERT_COOLDOWN_SECONDS:
+        return False
+    _micro_cooldown[key] = now
+    return True
+
+
+def _process_micro_scalp_alert(alert: Dict[str, Any]) -> None:
+    alert_id = database.insert_micro_scalp_alert(alert) if ENABLE_DATABASE else None
+    logger.info(
+        "MICRO %-12s | %s | score=%-3d | conf=%d%%",
+        alert.get("symbol"), alert.get("action"), alert.get("score", 0), alert.get("confidence", 0),
+    )
+    dispatch_micro_scalp_alert({**alert, "id": alert_id})
 
 
 def _init_cooldown_from_db() -> None:
@@ -295,7 +320,8 @@ def _process_alert(result: Dict[str, Any]) -> None:
             logger.exception("Error en auto_evaluate para %s", symbol)
 
 
-def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _scan_symbol(symbol: str, candidate: Dict[str, Any],
+                 market_regime: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     t0 = time.monotonic()
     try:
         ws_trades = get_trades_snapshot(symbol)
@@ -312,6 +338,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
                 for t in raw
             ]
 
+        t_api_start = time.monotonic()
         with ThreadPoolExecutor(max_workers=11) as ex:
             f_funding       = ex.submit(market_data.get_funding, symbol)
             f_oi            = ex.submit(market_data.get_open_interest, symbol)
@@ -337,6 +364,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
         multi_ex          = f_multi_ex.result()
         klines_1m         = f_klines_1m.result()
         orderbook_data   = ob_futures if ob_futures.get("orderbook_available") else ob_spot
+        t_api = time.monotonic() - t_api_start
 
         gex: Optional[Dict] = None
         if symbol in _GEX_SYMBOLS:
@@ -389,10 +417,12 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             funding=funding,
             open_interest=oi,
             price=price,
+            futures_price=futures_price,
             alert_report=alert_report if alert_report else None,
             volume_profile=vp,
             gex_data=gex,
             multi_exchange_data=multi_ex,
+            market_regime=market_regime,
         )
 
         # ── Price action trigger (paralelo — klines ya recuperados) ──────────
@@ -474,9 +504,29 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             except Exception:
                 logger.debug("[%s] setup evaluation falló", symbol)
 
+        ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+        micro_scalp = {"action": "WAIT", "score": 0, "confidence": 0}
+        if MICRO_SCALP_ENABLED:
+            try:
+                micro_scalp = detect_micro_scalp(
+                    symbol=symbol,
+                    price=futures_price or price,
+                    technical=technical,
+                    metrics=metrics,
+                    footprint=fp,
+                    orderbook=orderbook_data,
+                    funding=funding,
+                    open_interest=oi,
+                    oi_change_pct=oi_change_pct,
+                    multi_ex=multi_ex,
+                )
+                micro_scalp["timestamp"] = ts
+            except Exception:
+                logger.debug("[%s] micro scalper no disponible", symbol)
+
         result = {
             "symbol":          symbol.upper(),
-            "timestamp":       time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "timestamp":       ts,
             "price":           price,
             "futures_price":   futures_price,
             "metrics":         metrics,
@@ -496,6 +546,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             "alert_report":    alert_report,
             "oi_change_pct":   oi_change_pct,
             "multi_exchange":  multi_ex,
+            "market_regime":   market_regime or {},
             "trigger":         trigger,
             "setup_evaluation": setup_eval.to_dict() if setup_eval else None,
             # trend continuation
@@ -503,12 +554,18 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
             "momentum_continuation":      cont_val,
             "momentum_persistence_count": persistence_count,
             "trend_continuation_valid":   trend_continuation_valid,
+            "micro_scalp":                micro_scalp,
         }
 
         ml_predictor.apply_filter(result)
 
-        elapsed = time.monotonic() - t0
-        logger.debug("[%s] %.1fs score=%d action=%s", symbol, elapsed, score_data["score"], recommendation["action"])
+        t_total = time.monotonic() - t0
+        t_pipeline = t_total - t_api
+        logger.info(
+            "TIMING %-12s | api=%4.2fs | pipeline=%4.2fs | total=%4.2fs | score=%-3d | %s",
+            symbol, t_api, t_pipeline, t_total,
+            score_data["score"], recommendation["action"],
+        )
         return result
     except Exception:
         logger.exception("[%s] error en pipeline", symbol)
@@ -516,11 +573,15 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any]) -> Optional[Dict[str, A
 
 
 def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
+    t_cycle = time.monotonic()
+
+    t0 = time.monotonic()
     try:
         candidates = get_candidate_symbols(limit=candidate_limit)
     except Exception:
         logger.warning("get_candidate_symbols falló, usando fallback top-20")
         candidates = [{"symbol": s, "quote_volume": 0.0} for s in get_top_symbols(limit=20)]
+    t_candidates = time.monotonic() - t0
 
     if not candidates:
         logger.warning("Sin candidatos — saltando ciclo")
@@ -530,16 +591,36 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
     set_stream_symbols(syms)
     logger.info("Escaneando %d símbolos", len(candidates))
 
+    t0 = time.monotonic()
+    market_regime: Dict[str, Any] = {"regime": "NORMAL", "active": False}
+    try:
+        btc_technical = get_technical_context("BTCUSDT")
+        market_regime = detect_btc_market_regime(btc_technical)
+        if market_regime.get("active"):
+            logger.info(
+                "REGIMEN %s | BTC 1h=%+.2f%% 15m=%+.2f%% 5m=%+.2f%% | %s",
+                market_regime.get("regime"),
+                market_regime.get("btc_return_1h", 0.0),
+                market_regime.get("btc_return_15m", 0.0),
+                market_regime.get("btc_return_5m", 0.0),
+                market_regime.get("state", "normal"),
+            )
+    except Exception:
+        logger.debug("Regimen BTC no disponible; usando NORMAL")
+    t_regime = time.monotonic() - t0
+
+    t0 = time.monotonic()
     results: List[Dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_map = {
-            executor.submit(_scan_symbol, c["symbol"], c): c["symbol"]
+            executor.submit(_scan_symbol, c["symbol"], c, market_regime): c["symbol"]
             for c in candidates
         }
         for future in as_completed(future_map):
             result = future.result()
             if result:
                 results.append(result)
+    t_scan = time.monotonic() - t0
 
     results.sort(
         key=lambda x: (
@@ -549,11 +630,15 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
         reverse=True,
     )
 
+    t0 = time.monotonic()
     if ENABLE_DATABASE:
         database.insert_snapshots_batch(results)
         database.insert_multi_exchange_batch(results)
         logger.info("Snapshots insertados: %d", len(results))
+    t_db_snap = time.monotonic() - t0
 
+    t0 = time.monotonic()
+    alerts_sent = 0
     actionable = [r for r in results if r["recommendation"]["action"] != "WAIT"]
     for r in actionable:
         action = r["recommendation"]["action"]
@@ -573,8 +658,47 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
             else:
                 try:
                     _process_alert(r)
+                    alerts_sent += 1
                 except Exception:
                     logger.exception("Error procesando alerta %s", r["symbol"])
+    t_alerts = time.monotonic() - t0
+
+    t0 = time.monotonic()
+    micro_sent = 0
+    # Blackout horario: 20:00 UTC — 0% WR histórico en micro-scalp (-18% PnL total).
+    # Coincide con el cierre de commodities/metales en NY → whipsaws artificiales.
+    # El score sigue calculándose (para snapshots y observación), solo se bloquea el envío.
+    _utc_hour = time.gmtime().tm_hour
+    _micro_blackout = _utc_hour == 20
+    if _micro_blackout:
+        logger.debug("MICRO BLACKOUT activo: hora UTC=%d (20h bloqueada)", _utc_hour)
+
+    micro_actionable = [
+        r.get("micro_scalp") for r in results
+        if (r.get("micro_scalp") or {}).get("action") != "WAIT"
+    ]
+    for alert in micro_actionable:
+        action = alert.get("action", "")
+        symbol = alert.get("symbol", "")
+        if _micro_blackout:
+            logger.debug("MICRO BLACKOUT %-12s | %s | hora=%dh UTC bloqueada", symbol, action, _utc_hour)
+            continue
+        if not _should_send_micro_alert(symbol, action):
+            continue
+        try:
+            _process_micro_scalp_alert(alert)
+            micro_sent += 1
+        except Exception:
+            logger.exception("Error procesando micro-alerta %s", symbol)
+    t_micro = time.monotonic() - t0
+
+    t_total = time.monotonic() - t_cycle
+    logger.info(
+        "TIMING CICLO | simbolos=%-2d | candidatos=%4.2fs | regimen=%4.2fs | "
+        "scan=%5.2fs | db_snap=%4.2fs | alertas=%4.2fs(%d) | micro=%4.2fs(%d) | TOTAL=%5.2fs",
+        len(results), t_candidates, t_regime,
+        t_scan, t_db_snap, t_alerts, alerts_sent, t_micro, micro_sent, t_total,
+    )
 
     return results
 
@@ -599,6 +723,7 @@ def main() -> None:
 
     _outcome_cycle = 0
     _last_report_ts = 0.0          # epoch del último win rate report
+    _last_micro_report_ts = 0.0    # epoch del último reporte de micro-scalping
     _last_position_report_ts = 0.0 # epoch del último reporte de posiciones
 
     # Primer ciclo inmediato; luego esperar entre ciclos
@@ -619,6 +744,7 @@ def main() -> None:
             if _outcome_cycle % 4 == 0:
                 try:
                     run_outcome_tracker()
+                    run_micro_outcome_tracker()
                 except Exception:
                     logger.exception("Error en outcome tracker")
 
@@ -652,6 +778,21 @@ def main() -> None:
                         )
                 except Exception:
                     logger.exception("Error en reporte de win rate")
+
+        # Reporte de micro-scalping — misma cadencia que el win rate principal
+        if ENABLE_DATABASE and WINRATE_REPORT_ENABLED and MICRO_SCALP_ENABLED:
+            _micro_interval_s = WINRATE_REPORT_INTERVAL_HOURS * 3600
+            if time.time() - _last_micro_report_ts >= _micro_interval_s:
+                try:
+                    sent = send_micro_scalp_report(since_hours=WINRATE_REPORT_INTERVAL_HOURS * 2)
+                    if sent:
+                        _last_micro_report_ts = time.time()
+                        logger.info(
+                            "Reporte micro-scalp enviado (próximo en %.0fh)",
+                            WINRATE_REPORT_INTERVAL_HOURS,
+                        )
+                except Exception:
+                    logger.exception("Error en reporte de micro-scalp")
 
         elapsed = time.monotonic() - t0
         sleep_time = max(0.0, args.interval - elapsed)

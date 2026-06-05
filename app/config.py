@@ -23,7 +23,7 @@ MIN_QUOTE_VOLUME_USDT = float(os.getenv("MIN_QUOTE_VOLUME_USDT", "50000000"))   
 MAX_SPREAD_PCT = float(os.getenv("MAX_SPREAD_PCT", "0.08"))                      # 0.08%
 
 # ── Alert thresholds (por tipo de acción) ─────────────────────────────────
-MIN_ALERT_SCORE_BUY_SPOT = int(os.getenv("MIN_ALERT_SCORE_BUY_SPOT", "75"))
+MIN_ALERT_SCORE_BUY_SPOT = int(os.getenv("MIN_ALERT_SCORE_BUY_SPOT", "85"))
 MIN_ALERT_SCORE_SELL_SPOT = int(os.getenv("MIN_ALERT_SCORE_SELL_SPOT", "70"))
 MIN_ALERT_SCORE_LONG_FUTURES = int(os.getenv("MIN_ALERT_SCORE_LONG_FUTURES", "80"))
 MIN_ALERT_SCORE_SHORT_FUTURES = int(os.getenv("MIN_ALERT_SCORE_SHORT_FUTURES", "80"))
@@ -69,6 +69,9 @@ AUTO_TRADING_MAX_POSITIONS = int(os.getenv("AUTO_TRADING_MAX_POSITIONS", "5"))
 AUTO_TRADING_MARKETS       = os.getenv("AUTO_TRADING_MARKETS", "futures")     # futures | spot | both
 AUTO_TRADING_MIN_SCORE     = int(os.getenv("AUTO_TRADING_MIN_SCORE", "70"))
 AUTO_TRADING_TIMEOUT_HOURS = float(os.getenv("AUTO_TRADING_TIMEOUT_HOURS", "4"))
+AUTO_TRADING_RISK_CUT_ENABLED = os.getenv("AUTO_TRADING_RISK_CUT_ENABLED", "true").lower() == "true"
+AUTO_TRADING_RISK_CUT_MIN_HOURS = float(os.getenv("AUTO_TRADING_RISK_CUT_MIN_HOURS", "1"))
+AUTO_TRADING_RISK_CUT_LOSS_PCT = float(os.getenv("AUTO_TRADING_RISK_CUT_LOSS_PCT", "8"))
 # Tiers de sizing: score >= umbral → % del capital
 AUTO_TRADING_TIER1_SCORE   = int(os.getenv("AUTO_TRADING_TIER1_SCORE", "80"))   # 3%
 AUTO_TRADING_TIER2_SCORE   = int(os.getenv("AUTO_TRADING_TIER2_SCORE", "75"))   # 2%
@@ -101,6 +104,30 @@ ENABLE_TREND_CONTINUATION           = os.getenv("ENABLE_TREND_CONTINUATION",    
 TREND_CONTINUATION_MIN_SCORE        = int(os.getenv("TREND_CONTINUATION_MIN_SCORE",     "75"))
 TREND_CONTINUATION_MIN_PERSISTENCE  = int(os.getenv("TREND_CONTINUATION_MIN_PERSISTENCE", "3"))
 TREND_CONTINUATION_LOOKBACK         = int(os.getenv("TREND_CONTINUATION_LOOKBACK",      "10"))
+
+# ── Micro-scalping agresivo (alertas separadas) ────────────────────────────
+MICRO_SCALP_ENABLED = os.getenv("MICRO_SCALP_ENABLED", "true").lower() == "true"
+MICRO_SCALP_MIN_SCORE = int(os.getenv("MICRO_SCALP_MIN_SCORE", "75"))
+MICRO_SCALP_STRONG_SCORE = int(os.getenv("MICRO_SCALP_STRONG_SCORE", "85"))
+MICRO_SCALP_MIN_RVOL = float(os.getenv("MICRO_SCALP_MIN_RVOL", "2.0"))
+MICRO_SCALP_MIN_RETURN_5M = float(os.getenv("MICRO_SCALP_MIN_RETURN_5M", "0.20"))
+MICRO_SCALP_MIN_RETURN_3M = float(os.getenv("MICRO_SCALP_MIN_RETURN_3M", "0.10"))
+MICRO_SCALP_MAX_SPREAD_PCT = float(os.getenv("MICRO_SCALP_MAX_SPREAD_PCT", "0.06"))
+MICRO_SCALP_TIMEOUT_MINUTES = int(os.getenv("MICRO_SCALP_TIMEOUT_MINUTES", "10"))
+MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES = int(os.getenv("MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES", "60"))
+MICRO_SCALP_ALERT_COOLDOWN_SECONDS = int(os.getenv("MICRO_SCALP_ALERT_COOLDOWN_SECONDS", "180"))
+
+# ── Regimen global BTC (filtro direccional de mercado) ────────────────────
+BTC_REGIME_ENABLED = os.getenv("BTC_REGIME_ENABLED", "true").lower() == "true"
+BTC_RISK_OFF_RETURN_1H = float(os.getenv("BTC_RISK_OFF_RETURN_1H", "-1.0"))
+BTC_RISK_OFF_RETURN_15M = float(os.getenv("BTC_RISK_OFF_RETURN_15M", "-0.5"))
+BTC_RISK_OFF_RETURN_5M = float(os.getenv("BTC_RISK_OFF_RETURN_5M", "-0.15"))
+BTC_RISK_ON_RETURN_1H = float(os.getenv("BTC_RISK_ON_RETURN_1H", "1.0"))
+BTC_RISK_ON_RETURN_15M = float(os.getenv("BTC_RISK_ON_RETURN_15M", "0.5"))
+BTC_RISK_ON_RETURN_5M = float(os.getenv("BTC_RISK_ON_RETURN_5M", "0.15"))
+BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE = int(os.getenv("BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE", "85"))
+BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY = int(os.getenv("BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY", "10"))
+BTC_REGIME_ALIGNED_CONFIDENCE_BOOST = int(os.getenv("BTC_REGIME_ALIGNED_CONFIDENCE_BOOST", "5"))
 
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"
