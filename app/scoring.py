@@ -323,6 +323,7 @@ def _breakout_score(
     Permite detectar el inicio de movimientos antes de que EMA/HTF confirmen.
     """
     rel_vol    = technical.get("relative_volume", 1.0)
+    return_5m  = technical.get("return_5m", 0.0)
     return_15m = technical.get("return_15m", 0.0)
     cvd_15m    = metrics.get("cvd_15m", 0.0)
     cvd        = metrics.get("cvd", 0.0)
@@ -354,6 +355,13 @@ def _breakout_score(
         reasons.append(f"Precio rompiendo a la baja: {return_15m:.2f}% en 15m")
     elif bearish and return_15m <= -0.2:
         pts += 2
+
+    if bullish and return_15m >= 0.5 and return_5m >= 0.1:
+        pts += 2
+        reasons.append(f"Momentum 5m confirma breakout: {return_5m:+.2f}%")
+    elif bearish and return_15m <= -0.5 and return_5m <= -0.1:
+        pts += 2
+        reasons.append(f"Momentum 5m confirma breakdown: {return_5m:+.2f}%")
 
     if cvd_15m != 0 and ((bullish and cvd_15m > 0) or (bearish and cvd_15m < 0)):
         if cvd == 0 or abs(cvd_15m) > abs(cvd) * 0.25:
@@ -424,9 +432,21 @@ def _risk_penalty(
         warnings.append(f"RSI sobrevendido ({rsi:.1f}) — señal bajista puede estar agotada")
 
     # ── Sobreextensión del precio vs VWAP 1h ─────────────────────────────────
-    # Precio muy alejado del VWAP intradiario indica momentum agotado, no breakout sano.
-    # El VWAP de technical_context usa las últimas 60 velas de 1m (= 1 hora).
+    # Tres capas de penalización según severidad y contexto de momentum:
+    #
+    # Capa 1 (parabólica extrema, existente): precio >12–25% sobre VWAP → -6/-12 pts.
+    # Capa 2 (late entry, nueva): precio 2–11% sobre VWAP + retorno 1h ya ≥2%
+    #   → entrada tardía en impulso activo. CVD puede ser positivo pero el movimiento
+    #   ya corrió. Causa identificada en HOMEUSDT, CHZUSDT, NEARUSDT, TONUSDT.
+    # Capa 3 (momentum frenando, nueva): retorno 1h ≥3% pero últimos 3m casi planos
+    #   → impulso desacelerando visiblemente, precio extendido y compradores agotados.
+    #
+    # Las capas 2 y 3 son independientes y pueden acumularse (máx cap 45 global).
     vwap_dist = technical.get("vwap_distance_pct", 0.0)
+    ret_1h    = technical.get("return_1h",         0.0)
+    ret_3m    = technical.get("return_3m",         0.0)
+
+    # Capa 1: parabólica extrema (umbrales originales, sin cambio)
     if bullish and vwap_dist >= 25:
         penalty += 12
         warnings.append(f"Precio sobreextendido sobre VWAP 1h: +{vwap_dist:.1f}% — riesgo de reversión elevado")
@@ -440,11 +460,52 @@ def _risk_penalty(
         penalty += 6
         warnings.append(f"Precio alejado de VWAP 1h: {vwap_dist:.1f}%")
 
+    # Capa 2: late entry en impulso — vwap_dist moderado pero retorno 1h ya grande
+    # Solo aplica en el rango 2–11% para no solaparse con la capa 1 (≥12%)
+    if bullish and 2.0 <= vwap_dist < 12.0 and ret_1h >= 2.0:
+        if vwap_dist >= 3.0:
+            penalty += 15
+            warnings.append(
+                f"Entrada tardía: +{vwap_dist:.1f}% sobre VWAP con retorno 1h ya en +{ret_1h:.1f}% — movimiento extendido"
+            )
+        else:
+            penalty += 8
+            warnings.append(
+                f"Entrada tardía: +{vwap_dist:.1f}% sobre VWAP, retorno 1h +{ret_1h:.1f}%"
+            )
+    elif bearish and -12.0 < vwap_dist <= -2.0 and ret_1h <= -2.0:
+        if vwap_dist <= -3.0:
+            penalty += 15
+            warnings.append(
+                f"Entrada tardía bajista: {vwap_dist:.1f}% bajo VWAP con caída 1h ya en {ret_1h:.1f}%"
+            )
+        else:
+            penalty += 8
+            warnings.append(
+                f"Entrada tardía bajista: {vwap_dist:.1f}% bajo VWAP, retorno 1h {ret_1h:.1f}%"
+            )
+
+    # Capa 3: momentum frenando — impulso 1h fuerte pero últimos 3m casi planos
+    # Indica que los compradores/vendedores están agotándose cerca del máximo/mínimo.
+    # Guarda: ret_3m != 0.0 evita activarse con el valor default cuando no hay datos.
+    # Umbral ret_1h >= 4.0 (en lugar de 3.0) reduce falsos positivos en tendencias válidas.
+    if bullish and ret_1h >= 4.0 and ret_3m != 0.0 and abs(ret_3m) < 0.3 and vwap_dist >= 1.5:
+        penalty += 8
+        warnings.append(
+            f"Momentum frenando: impulso 1h +{ret_1h:.1f}% pero 3m solo {ret_3m:+.2f}% — posible techo"
+        )
+    elif bearish and ret_1h <= -4.0 and ret_3m != 0.0 and abs(ret_3m) < 0.3 and vwap_dist <= -1.5:
+        penalty += 8
+        warnings.append(
+            f"Momentum frenando bajista: caída 1h {ret_1h:.1f}% pero 3m solo {ret_3m:+.2f}% — posible suelo"
+        )
+
     # ── Divergencia CVD/precio ────────────────────────────────────────────────
     # Precio subiendo pero CVD 15m negativo = venta institucional en fuerza (distribución silenciosa).
     # Precio bajando pero CVD 15m positivo = compra institucional en debilidad (acumulación silenciosa).
     if metrics:
         cvd_15m = metrics.get("cvd_15m", 0.0)
+        return_5m = technical.get("return_5m", 0.0)
         return_15m = technical.get("return_15m", 0.0)
         if bullish and return_15m >= 2.0 and cvd_15m < 0:
             penalty += 8
@@ -456,6 +517,13 @@ def _risk_penalty(
             warnings.append(
                 f"Divergencia alcista: precio {return_15m:.1f}% en 15m pero CVD 15m positivo ({cvd_15m:.0f})"
             )
+
+        if bullish and return_15m >= 0.5 and return_5m <= -0.2:
+            penalty += 4
+            warnings.append(f"Momentum 5m contradice breakout alcista ({return_5m:+.2f}%)")
+        elif bearish and return_15m <= -0.5 and return_5m >= 0.2:
+            penalty += 4
+            warnings.append(f"Momentum 5m contradice breakdown bajista ({return_5m:+.2f}%)")
 
     # ── Trade aglomerado por funding extremo direccional ──────────────────────
     # Cuando el funding es extremo EN LA DIRECCIÓN DE LA SEÑAL, el trade está
@@ -474,11 +542,18 @@ def _risk_penalty(
 
 def _multi_exchange_score(
     multi_ex: Optional[Dict[str, Any]],
+    signal: str = "",
 ) -> Tuple[int, List[str]]:
-    """Confirmación cruzada Coinbase + Kraken. Máx +5, mín -18.
+    """Confirmación cruzada Coinbase + Kraken. Máx +10, mín -18.
+
+    Dos capas de confirmación:
+      1. Alineación de precio spot (±0.10-0.50%)  → ±pts como antes
+      2. Confirmación de tendencia en exchanges externos (historial en memoria)
+         → +5 si ambos confirman dirección del signal
+         → +2 si uno confirma
+         → -5 si la tendencia externa contradice el signal
 
     None = altcoin sin soporte externo → 0 pts, sin penalización.
-    La lógica None-neutral es crítica: no penalizar altcoins por ausencia de dato.
     """
     if not multi_ex or not multi_ex.get("ok"):
         return 0, []
@@ -491,9 +566,9 @@ def _multi_exchange_score(
 
     pts: int = 0
     reasons: List[str] = []
-
     avail = multi_ex.get("exchange_availability_score", 100)
 
+    # ── Capa 1: alineación de precio spot ────────────────────────────────
     if conf >= 80:
         pts += 5
         reasons.append(f"Confirmacion multi-exchange: {conf:.0f}% ({avail:.0f}% disponibilidad)")
@@ -507,6 +582,41 @@ def _multi_exchange_score(
     if dev is not None and dev > 0.35:
         pts -= 8
         reasons.append(f"Divergencia de precio entre exchanges: {dev:.3f}%")
+
+    # ── Capa 2: confirmación de tendencia (historial de precios externos) ─
+    ext_trend = multi_ex.get("external_trend")
+    trend_count = multi_ex.get("external_trend_count", 0)
+    ext_returns = multi_ex.get("external_returns", {})
+
+    if ext_trend and ext_trend != "neutral":
+        signal_bullish = signal in _BULLISH
+        signal_bearish = signal in _BEARISH
+        trend_bullish  = ext_trend == "bullish"
+        trend_bearish  = ext_trend == "bearish"
+
+        aligned = (signal_bullish and trend_bullish) or (signal_bearish and trend_bearish)
+        opposed = (signal_bullish and trend_bearish) or (signal_bearish and trend_bullish)
+
+        ret_parts = ", ".join(
+            f"{name}: {r:+.2f}%" for name, r in sorted(ext_returns.items())
+        )
+
+        if aligned:
+            if trend_count >= 2:
+                pts += 5
+                reasons.append(
+                    f"Tendencia {ext_trend} confirmada en {trend_count} exchanges ({ret_parts})"
+                )
+            else:
+                pts += 2
+                reasons.append(
+                    f"Tendencia {ext_trend} confirmada externamente ({ret_parts})"
+                )
+        elif opposed:
+            pts -= 5
+            reasons.append(
+                f"Tendencia externa contradice signal: {ext_trend} vs {signal} ({ret_parts})"
+            )
 
     return pts, reasons
 
@@ -539,7 +649,7 @@ def calculate_opportunity_score(
     fut_pts, fut_r = _futures_score(signal, funding, open_interest, liquidation_summary, oi_change_pct)
     gex_pts, gex_r = _gex_score(gex_data, signal, price)
     bk_pts, bk_r  = _breakout_score(technical, metrics, signal)
-    mx_pts, mx_r  = _multi_exchange_score(multi_exchange_data)
+    mx_pts, mx_r  = _multi_exchange_score(multi_exchange_data, signal)
     penalty, warnings = _risk_penalty(signal, funding, spread_pct, technical, breakout_pts=bk_pts, metrics=metrics)
 
     raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts + mx_pts - penalty
