@@ -1,11 +1,11 @@
 """Score de confluencia institucional.
 
-Distribución de puntos (total: ~105 teórico, efectivo 100 con cap):
-    flow_score          30  — señal + CVD 1h + CVD 15m aceleración + OBI + liquidaciones
+Distribución de puntos (total: ~110 teórico, efectivo 100 con cap):
+    flow_score          30  — señal + CVD 1h + CVD 15m aceleración graduada + OBI + liquidaciones
     technical_score     25  — VWAP + EMA 1m + EMA 1h (HTF) + momentum + RVOL
     volume_profile_score 15 — cercanía a POC / HVN / LVN
     footprint_score     15  — absorción, stacked imbalance, delta
-    futures_score       15  — OI, funding, liquidaciones de futuros
+    futures_score       15  — OI direccional + OI rate + funding + liquidaciones
     gex_score            5  — niveles gamma (BTC/ETH, opcional)
     risk_penalty        -45 — máximo posible de penalización
 
@@ -44,12 +44,19 @@ def _flow_score(
         pts += 6
         reasons.append(f"CVD alineado con señal: {cvd:.2f}")
 
-    # Aceleración: flujo de los últimos 15 min va en la misma dirección
-    # y representa más del 25% del CVD de la hora → presión reciente creciente
+    # Aceleración CVD: el flujo reciente (15m) supera una fracción del acumulado (1h).
+    # Graduated: aceleración fuerte (>50% del 1h en 15m) vale más que moderada (>25%).
+    # Captura el fenómeno del 07:00 UTC (Asia→Europa) sin depender de la hora:
+    # el cvd_15m enorme en esa ventana se debe a que el flujo de cierre asiático
+    # se concentra en esos minutos, no distribuido en toda la hora.
     cvd_abs = abs(cvd)
     cvd_15m_abs = abs(cvd_15m)
     if cvd_15m_abs > 0 and ((bullish and cvd_15m > 0) or (bearish and cvd_15m < 0)):
-        if cvd_abs == 0 or cvd_15m_abs > cvd_abs * 0.25:
+        if cvd_abs > 0 and cvd_15m_abs > cvd_abs * 0.50:
+            pts += 5
+            ratio = cvd_15m_abs / cvd_abs
+            reasons.append(f"CVD acelerando fuerte — 15m es {ratio:.0%} del 1h: {cvd_15m:.0f}")
+        elif cvd_abs == 0 or cvd_15m_abs > cvd_abs * 0.25:
             pts += 3
             reasons.append(f"CVD acelerando — flujo 15m confirma dirección: {cvd_15m:.0f}")
 
@@ -260,7 +267,20 @@ def _futures_score(
             pts += 4
             reasons.append(f"Funding positivo ({funding:.5f}) — favorece cortos")
 
-    # OI change rate: convicción de nuevas posiciones institucionales
+    # OI alineación direccional: capital moviéndose EN la dirección del trade.
+    # Datos: OI creciendo ≥0.5% es el predictor individual #1 (+13.7pp lift global).
+    # LONG + OI creciente = nuevas posiciones largas abriendo = convicción real.
+    # SHORT + OI cayente = largos cerrando = valida la tesis bajista.
+    if (bullish and oi_change_pct >= 0.5) or (bearish and oi_change_pct <= -0.5):
+        pts += 5
+        direction = "creciendo" if oi_change_pct > 0 else "cayendo"
+        reasons.append(f"OI {direction} alineado ({oi_change_pct:+.2f}%) — capital institucional en dirección del trade")
+    elif (bullish and oi_change_pct <= -1.0):
+        # Longs cerrando mientras la señal es alcista = convicción débil
+        pts -= 2
+        reasons.append(f"OI cayendo con LONG ({oi_change_pct:+.2f}%) — longs cerrando posiciones")
+
+    # OI change rate absoluto: magnitud de la actividad (existente, sin cambio)
     abs_oi_chg = abs(oi_change_pct)
     if abs_oi_chg >= 5.0:
         pts += 3
