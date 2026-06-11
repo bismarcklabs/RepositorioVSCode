@@ -180,7 +180,7 @@ def evaluate_trade_setup(
     else:
         warnings.append("No hay niveles de entrada, stop y take profit calculados.")
 
-    # ── 6. Confirmación multi-exchange (+5 / -10) ─────────────────────────────
+    # ── 6. Confirmación multi-exchange (+5 precio / +5 tendencia / -15 divergencia) ──
     mx      = multi_exchange or {}
     mx_conf = mx.get("multi_exchange_confidence")
     if mx_conf is not None:
@@ -191,6 +191,26 @@ def evaluate_trade_setup(
             checklist["external_ok"] = False
             score -= 10
             warnings.append(f"Confirmación multi-exchange débil: {mx_conf:.0f}%.")
+
+    ext_trend = mx.get("external_trend")
+    ext_count = mx.get("external_trend_count", 0)
+    if ext_trend and ext_trend != "neutral":
+        is_long  = action in ("LONG_FUTURES", "BUY_SPOT")
+        is_short = action in ("SHORT_FUTURES", "SELL_SPOT")
+        aligned = (is_long and ext_trend == "bullish") or (is_short and ext_trend == "bearish")
+        opposed = (is_long and ext_trend == "bearish") or (is_short and ext_trend == "bullish")
+        if aligned:
+            pts = 5 if ext_count >= 2 else 3
+            score += pts
+            reasons.append(
+                f"Tendencia {ext_trend} confirmada en {ext_count} exchange(s) externo(s)."
+            )
+        elif opposed:
+            checklist["external_ok"] = False
+            score -= 5
+            warnings.append(
+                f"Tendencia externa contradice la dirección del trade ({ext_trend})."
+            )
 
     # ── Grado final ───────────────────────────────────────────────────────────
     score = max(0, min(100, score))

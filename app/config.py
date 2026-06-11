@@ -50,6 +50,45 @@ OUTCOME_TRACKER_ENABLED = os.getenv("OUTCOME_TRACKER_ENABLED", "true").lower() =
 _raw_horizons = os.getenv("OUTCOME_HORIZONS_MINUTES", "15,60,240,1440")
 OUTCOME_HORIZONS_MINUTES: list = [int(x) for x in _raw_horizons.split(",") if x.strip()]
 
+# News intelligence observacional
+NEWS_INTELLIGENCE_ENABLED = os.getenv("NEWS_INTELLIGENCE_ENABLED", "false").lower() == "true"
+NEWS_GDELT_ENABLED = os.getenv("NEWS_GDELT_ENABLED", "true").lower() == "true"
+NEWS_GOOGLE_RSS_ENABLED = os.getenv("NEWS_GOOGLE_RSS_ENABLED", "true").lower() == "true"
+CRYPTOPANIC_AUTH_TOKEN = os.getenv("CRYPTOPANIC_AUTH_TOKEN", "")
+NEWS_RSS_FEEDS = [
+    value.strip()
+    for value in os.getenv(
+        "NEWS_RSS_FEEDS",
+        "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    ).split(",")
+    if value.strip()
+]
+NEWS_COLLECTION_INTERVAL_SECONDS = int(os.getenv("NEWS_COLLECTION_INTERVAL_SECONDS", "900"))
+NEWS_REPORT_INTERVAL_SECONDS = int(os.getenv("NEWS_REPORT_INTERVAL_SECONDS", "3600"))
+NEWS_LOOKBACK_HOURS = float(os.getenv("NEWS_LOOKBACK_HOURS", "6"))
+NEWS_MAX_SYMBOLS = int(os.getenv("NEWS_MAX_SYMBOLS", "20"))
+NEWS_WATCH_SYMBOLS = [
+    value.strip().upper()
+    for value in os.getenv("NEWS_WATCH_SYMBOLS", "").split(",")
+    if value.strip()
+]
+NEWS_MIN_ABS_SCORE = float(os.getenv("NEWS_MIN_ABS_SCORE", "5"))
+NEWS_OUTCOME_HORIZON_MINUTES = int(os.getenv("NEWS_OUTCOME_HORIZON_MINUTES", "60"))
+
+# Alertas tempranas de seguridad de protocolo (solo atencion; nunca opera)
+SECURITY_ALERTS_ENABLED = os.getenv("SECURITY_ALERTS_ENABLED", "true").lower() == "true"
+SECURITY_ALERT_MIN_ABS_SCORE = float(os.getenv("SECURITY_ALERT_MIN_ABS_SCORE", "15"))
+SECURITY_ALERT_LOOKBACK_HOURS = float(os.getenv("SECURITY_ALERT_LOOKBACK_HOURS", "168"))
+SECURITY_COLLECTION_INTERVAL_SECONDS = int(os.getenv("SECURITY_COLLECTION_INTERVAL_SECONDS", "300"))
+SECURITY_GITHUB_REPOS = [
+    tuple(part.strip() for part in value.split("|", 1))
+    for value in os.getenv(
+        "SECURITY_GITHUB_REPOS",
+        "zcash/zcash|ZECUSDT,ZcashFoundation/zebra|ZECUSDT",
+    ).split(",")
+    if "|" in value
+]
+
 # ── Notificaciones — Discord ───────────────────────────────────────────────
 ENABLE_DISCORD_ALERTS = os.getenv("ENABLE_DISCORD_ALERTS", "false").lower() == "true"
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -72,6 +111,16 @@ AUTO_TRADING_TIMEOUT_HOURS = float(os.getenv("AUTO_TRADING_TIMEOUT_HOURS", "4"))
 AUTO_TRADING_RISK_CUT_ENABLED = os.getenv("AUTO_TRADING_RISK_CUT_ENABLED", "true").lower() == "true"
 AUTO_TRADING_RISK_CUT_MIN_HOURS = float(os.getenv("AUTO_TRADING_RISK_CUT_MIN_HOURS", "1"))
 AUTO_TRADING_RISK_CUT_LOSS_PCT = float(os.getenv("AUTO_TRADING_RISK_CUT_LOSS_PCT", "8"))
+AUTO_TRADING_PAPER_MAX_LOSS_PCT = float(os.getenv("AUTO_TRADING_PAPER_MAX_LOSS_PCT", "12"))
+AUTO_TRADING_USE_CALIBRATED_GRADE = os.getenv("AUTO_TRADING_USE_CALIBRATED_GRADE", "true").lower() == "true"
+AUTO_TRADING_ALLOWED_CALIBRATED_GRADES: set = {
+    x.strip().upper() for x in os.getenv("AUTO_TRADING_ALLOWED_CALIBRATED_GRADES", "A,B,C").split(",") if x.strip()
+}
+AUTO_TRADING_C_SHORT_MIN_SCORE = int(os.getenv("AUTO_TRADING_C_SHORT_MIN_SCORE", "75"))
+AUTO_TRADING_C_LONG_MIN_SCORE = int(os.getenv("AUTO_TRADING_C_LONG_MIN_SCORE", "85"))
+AUTO_TRADING_COUNTERTREND_MIN_SCORE = int(os.getenv("AUTO_TRADING_COUNTERTREND_MIN_SCORE", "90"))
+AUTO_TRADING_LOSS_COOLDOWN_COUNT = int(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_COUNT", "2"))
+AUTO_TRADING_LOSS_COOLDOWN_HOURS = float(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_HOURS", "6"))
 # Tiers de sizing: score >= umbral → % del capital
 AUTO_TRADING_TIER1_SCORE   = int(os.getenv("AUTO_TRADING_TIER1_SCORE", "80"))   # 3%
 AUTO_TRADING_TIER2_SCORE   = int(os.getenv("AUTO_TRADING_TIER2_SCORE", "75"))   # 2%
@@ -96,6 +145,8 @@ SETUP_ALERT_GRADES: set = {
     for x in os.getenv("SETUP_ALERT_GRADES", "A,B").split(",")
     if x.strip()
 }
+CALIBRATED_SETUP_ENABLED = os.getenv("CALIBRATED_SETUP_ENABLED", "true").lower() == "true"
+CALIBRATION_VERSION = os.getenv("CALIBRATION_VERSION", "rules-v1-observe")
 
 # ── Trend continuation (segunda vía de alerta sin gatillo clásico) ────────
 # Activa detección de tendencias fuertes sostenidas (JTO/STG/WLD style).
@@ -108,6 +159,7 @@ TREND_CONTINUATION_LOOKBACK         = int(os.getenv("TREND_CONTINUATION_LOOKBACK
 # ── Micro-scalping agresivo (alertas separadas) ────────────────────────────
 MICRO_SCALP_ENABLED = os.getenv("MICRO_SCALP_ENABLED", "true").lower() == "true"
 MICRO_SCALP_MIN_SCORE = int(os.getenv("MICRO_SCALP_MIN_SCORE", "75"))
+MICRO_LONG_MIN_SCORE = int(os.getenv("MICRO_LONG_MIN_SCORE", "80"))
 MICRO_SCALP_STRONG_SCORE = int(os.getenv("MICRO_SCALP_STRONG_SCORE", "85"))
 MICRO_SCALP_MIN_RVOL = float(os.getenv("MICRO_SCALP_MIN_RVOL", "2.0"))
 MICRO_SCALP_MIN_RETURN_5M = float(os.getenv("MICRO_SCALP_MIN_RETURN_5M", "0.20"))

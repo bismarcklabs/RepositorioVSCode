@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import (
     MICRO_SCALP_MIN_SCORE,
+    MICRO_LONG_MIN_SCORE,
     MICRO_SCALP_STRONG_SCORE,
     MICRO_SCALP_MIN_RVOL,
     MICRO_SCALP_MIN_RETURN_5M,
@@ -182,6 +183,7 @@ def detect_micro_scalp(
     open_interest: float,
     oi_change_pct: float,
     multi_ex: Optional[Dict[str, Any]] = None,
+    market_regime: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Retorna una micro-alerta o WAIT."""
     if price <= 0 or open_interest <= 0:
@@ -211,7 +213,15 @@ def detect_micro_scalp(
         action = "MICRO_SHORT_SCALP"
         score, reasons, warnings = short_score, short_reasons, short_warnings
 
-    if score < MICRO_SCALP_MIN_SCORE:
+    regime_name = (market_regime or {}).get("regime", "NORMAL")
+    if action == "MICRO_LONG_SCALP" and regime_name == "BTC_RISK_OFF":
+        return {
+            "action": "WAIT", "score": score, "confidence": max(0, min(95, score)),
+            "reasons": reasons, "warnings": warnings + ["Micro-long bloqueado por BTC_RISK_OFF"],
+        }
+
+    min_score = MICRO_LONG_MIN_SCORE if action == "MICRO_LONG_SCALP" else MICRO_SCALP_MIN_SCORE
+    if score < min_score:
         return {
             "action": "WAIT",
             "score": score,

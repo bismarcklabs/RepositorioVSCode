@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest tests/test_setup_calibrator.py -q)"
+    ]
+  }
+}

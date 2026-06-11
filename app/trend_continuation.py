@@ -19,6 +19,7 @@ def is_long_momentum_continuation(snapshot: Dict[str, Any]) -> bool:
         and technical.get("above_vwap")  is True
         and float(technical.get("return_1h",       0) or 0) >= 2.0
         and float(technical.get("return_15m",      0) or 0) >= 0.5
+        and float(technical.get("return_5m",       0) or 0) >= 0.1
         and float(technical.get("relative_volume", 1) or 1) >= 1.2
         and float(metrics.get("cvd_15m", 0) or 0) > 0
         and float(metrics.get("cvd",     0) or 0) > 0
@@ -37,6 +38,7 @@ def is_short_momentum_continuation(snapshot: Dict[str, Any]) -> bool:
         and technical.get("above_vwap")  is False
         and float(technical.get("return_1h",       0) or 0) <= -2.0
         and float(technical.get("return_15m",      0) or 0) <= -0.5
+        and float(technical.get("return_5m",       0) or 0) <= -0.1
         and float(technical.get("relative_volume", 1) or 1) >= 1.2
         and float(metrics.get("cvd_15m", 0) or 0) < 0
         and float(metrics.get("cvd",     0) or 0) < 0
@@ -84,6 +86,7 @@ def calculate_trend_priority_score(snapshot: Dict[str, Any], direction: str) -> 
 
     ret_1h  = float(technical.get("return_1h",  0) or 0)
     ret_15m = float(technical.get("return_15m", 0) or 0)
+    ret_5m  = float(technical.get("return_5m",  0) or 0)
 
     if (is_long and ret_1h >= 2.0) or (not is_long and ret_1h <= -2.0):
         score += 20
@@ -92,6 +95,13 @@ def calculate_trend_priority_score(snapshot: Dict[str, Any], direction: str) -> 
     if (is_long and ret_15m >= 0.5) or (not is_long and ret_15m <= -0.5):
         score += 10
         reasons.append(f"Momentum 15m positivo ({ret_15m:+.1f}%).")
+
+    if (is_long and ret_5m >= 0.1) or (not is_long and ret_5m <= -0.1):
+        score += 5
+        reasons.append(f"Momentum 5m confirma ({ret_5m:+.1f}%).")
+    elif (is_long and ret_5m < 0) or (not is_long and ret_5m > 0):
+        score -= 10
+        warnings.append(f"Momentum 5m contradice continuacion ({ret_5m:+.1f}%).")
 
     cvd_15m = float(metrics.get("cvd_15m", 0) or 0)
     if (is_long and cvd_15m > 0) or (not is_long and cvd_15m < 0):

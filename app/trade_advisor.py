@@ -6,8 +6,12 @@ from app.config import (
     MIN_ALERT_SCORE_LONG_FUTURES,
     MIN_ALERT_SCORE_SELL_SPOT,
     MIN_ALERT_SCORE_SHORT_FUTURES,
+    BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE,
+    BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY,
+    BTC_REGIME_ALIGNED_CONFIDENCE_BOOST,
 )
 from app.entry_exit import calculate_entry_exit
+from app.market_regime import is_aligned_action, is_countertrend_action
 
 _BULLISH = {"accumulation", "bullish_continuation", "short_squeeze"}
 _BEARISH = {"distribution", "long_squeeze"}
@@ -78,10 +82,12 @@ def build_trade_recommendation(
     funding: float,
     open_interest: float,
     price: float = 0.0,
+    futures_price: Optional[float] = None,
     alert_report: Optional[Dict[str, Any]] = None,
     volume_profile: Optional[Dict[str, Any]] = None,
     gex_data: Optional[Dict[str, Any]] = None,
     multi_exchange_data: Optional[Dict[str, Any]] = None,
+    market_regime: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     score = score_data.get("score", 0)
     warnings = list(score_data.get("warnings", []))
@@ -157,6 +163,26 @@ def build_trade_recommendation(
     # Solo actúa cuando hay datos externos (external_supported=True).
     # Para altcoins (external_supported=False o mx_conf=None): sin ajuste,
     # sin warning — no penalizar por ausencia de dato externo.
+    regime = market_regime or {}
+    if action != "WAIT" and regime.get("active"):
+        regime_name = regime.get("regime", "NORMAL")
+        if is_countertrend_action(action, regime):
+            if score < BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE:
+                warnings.append(
+                    f"{regime_name} activo: {action} bloqueado por ir contra BTC "
+                    f"(score {score} < {BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE})"
+                )
+                action = "WAIT"
+                market = "NONE"
+            else:
+                confidence = max(40, confidence - BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY)
+                warnings.append(
+                    f"{regime_name} activo: {action} permitido solo por score alto; confianza penalizada"
+                )
+        elif is_aligned_action(action, regime):
+            confidence = min(95, confidence + BTC_REGIME_ALIGNED_CONFIDENCE_BOOST)
+            reasons.append(f"{regime_name} activo: direccion alineada con BTC")
+
     if action != "WAIT" and multi_exchange_data and multi_exchange_data.get("ok"):
         if multi_exchange_data.get("external_supported"):
             mx_conf  = multi_exchange_data.get("multi_exchange_confidence")
@@ -183,6 +209,25 @@ def build_trade_recommendation(
                         f"Divergencia de precio entre exchanges: {mx_dev:.3f}% — validar entrada"
                     )
 
+            # Ajuste por tendencia confirmada en exchanges externos (historial en memoria)
+            ext_trend = multi_exchange_data.get("external_trend")
+            ext_count = multi_exchange_data.get("external_trend_count", 0)
+            if ext_trend and ext_trend != "neutral":
+                is_bullish_action = action in ("LONG_FUTURES", "BUY_SPOT")
+                is_bearish_action = action in ("SHORT_FUTURES", "SELL_SPOT")
+                aligned = (is_bullish_action and ext_trend == "bullish") or \
+                          (is_bearish_action and ext_trend == "bearish")
+                opposed = (is_bullish_action and ext_trend == "bearish") or \
+                          (is_bearish_action and ext_trend == "bullish")
+                if aligned and ext_count >= 2:
+                    confidence = min(95, confidence + 3)
+                    reasons.append(f"Tendencia {ext_trend} confirmada en {ext_count} exchanges externos")
+                elif aligned:
+                    confidence = min(95, confidence + 1)
+                elif opposed:
+                    confidence = max(40, confidence - 4)
+                    warnings.append(f"Tendencia externa contradice la operacion: {ext_trend}")
+
             # Propagar advertencias del aggregator que no estén ya cubiertas
             for w in mx_warns:
                 already_covered = any(
@@ -195,9 +240,10 @@ def build_trade_recommendation(
     # ── Calcular niveles operables ────────────────────────────────────────
     setup: Optional[Dict[str, Any]] = None
     if action != "WAIT":
+        setup_price = (futures_price or price) if "FUTURES" in action else price
         setup = calculate_entry_exit(
             action=action,
-            price=price,
+            price=setup_price,
             technical=technical,
             volume_profile=volume_profile,
             gex_data=gex_data,
@@ -218,6 +264,7 @@ def build_trade_recommendation(
         "warnings": warnings,
         "invalidation": _invalidation(signal, funding, volume_profile),
         "risk_level": risk_level,
+        "market_regime": regime,
         # ── Niveles operables (None si action == WAIT) ──────────────────
         "setup": setup,
     }

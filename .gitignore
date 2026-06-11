@@ -24,3 +24,6 @@ build/
 .idea/
 *.swp
 *.swo
+
+# Configuracion local de Claude Code (permisos especificos de la maquina)
+.claude/settings.local.json

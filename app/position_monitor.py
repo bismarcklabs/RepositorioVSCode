@@ -19,7 +19,12 @@ from app.config import (
     AUTO_TRADING_ENABLED,
     AUTO_TRADING_MODE,
     AUTO_TRADING_CAPITAL_USDT,
+    AUTO_TRADING_MAX_POSITIONS,
     AUTO_TRADING_TIMEOUT_HOURS,
+    AUTO_TRADING_RISK_CUT_ENABLED,
+    AUTO_TRADING_RISK_CUT_MIN_HOURS,
+    AUTO_TRADING_RISK_CUT_LOSS_PCT,
+    AUTO_TRADING_PAPER_MAX_LOSS_PCT,
     ENABLE_TELEGRAM_ALERTS,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
@@ -135,33 +140,57 @@ def check_positions() -> None:
         tp1_hit   = bool(pos.get("tp1_hit"))
 
         pnl = calc_pnl(pos, price)
-
-        # ── Timeout ────────────────────────────────────────────────────────
-        if _elapsed_hours(pos["open_time"]) >= AUTO_TRADING_TIMEOUT_HOURS:
-            database.close_auto_position(
-                pos["id"], price, "timeout",
-                pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
-            )
-            logger.info("AUTO TIMEOUT %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
-                        action, sym, price, pnl["total_pnl_usdt"], pnl["total_pnl_pct"])
-            _notify_close(pos, price, "timeout", pnl)
-            continue
+        elapsed_hours = _elapsed_hours(pos["open_time"])
 
         # ── SL ─────────────────────────────────────────────────────────────
         sl_triggered = (direction == 1 and price <= sl) or (direction == -1 and price >= sl)
         if sl_triggered:
             reason = "sl_breakeven" if tp1_hit else "sl"
+            # En paper se simula ejecucion en el stop configurado. Usar el ultimo
+            # precio observado convierte un gap del monitor en una perdida ficticia.
+            exit_price = sl if AUTO_TRADING_MODE == "paper" else price
+            exit_pnl = calc_pnl(pos, exit_price)
             database.close_auto_position(
-                pos["id"], price, reason,
-                pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+                pos["id"], exit_price, reason,
+                exit_pnl["open_pnl_usdt"], exit_pnl["total_pnl_usdt"], exit_pnl["total_pnl_pct"],
             )
             logger.info("AUTO SL%s %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
                         "(BE)" if tp1_hit else "", action, sym,
-                        price, pnl["total_pnl_usdt"], pnl["total_pnl_pct"])
-            _notify_close(pos, price, reason, pnl)
+                        exit_price, exit_pnl["total_pnl_usdt"], exit_pnl["total_pnl_pct"])
+            _notify_close(pos, exit_price, reason, exit_pnl)
             continue
 
         # ── TP2 (solo si TP1 ya fue tocado) ───────────────────────────────
+        # Hard cap adicional para paper si faltara o fallara el stop.
+        if AUTO_TRADING_MODE == "paper" and pnl["total_pnl_pct"] <= -abs(AUTO_TRADING_PAPER_MAX_LOSS_PCT):
+            max_move = abs(AUTO_TRADING_PAPER_MAX_LOSS_PCT) / (100.0 * leverage)
+            cap_price = entry * (1.0 - direction * max_move)
+            cap_pnl = calc_pnl(pos, cap_price)
+            database.close_auto_position(
+                pos["id"], cap_price, "paper_hard_cap",
+                cap_pnl["open_pnl_usdt"], cap_pnl["total_pnl_usdt"], cap_pnl["total_pnl_pct"],
+            )
+            logger.warning("AUTO PAPER HARD CAP %s %s | P&L %.2f%%", action, sym, cap_pnl["total_pnl_pct"])
+            _notify_close(pos, cap_price, "paper_hard_cap", cap_pnl)
+            continue
+
+        if (
+            AUTO_TRADING_RISK_CUT_ENABLED
+            and not tp1_hit
+            and elapsed_hours >= AUTO_TRADING_RISK_CUT_MIN_HOURS
+            and pnl["total_pnl_pct"] <= -abs(AUTO_TRADING_RISK_CUT_LOSS_PCT)
+        ):
+            database.close_auto_position(
+                pos["id"], price, "risk_cut",
+                pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+            )
+            logger.info(
+                "AUTO RISK CUT %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
+                action, sym, price, pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+            )
+            _notify_close(pos, price, "risk_cut", pnl)
+            continue
+
         if tp1_hit and tp2:
             tp2_hit = (direction == 1 and price >= tp2) or (direction == -1 and price <= tp2)
             if tp2_hit:
@@ -196,6 +225,16 @@ def check_positions() -> None:
                         pnl2["open_pnl_usdt"], tp1_pnl_usdt, round(tp1_pnl_usdt / size * 100, 2),
                     )
                     logger.info("AUTO TP1_ONLY %s %s | sin TP2 → cerrado", action, sym)
+
+        if elapsed_hours >= AUTO_TRADING_TIMEOUT_HOURS:
+            database.close_auto_position(
+                pos["id"], price, "timeout",
+                pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+            )
+            logger.info("AUTO TIMEOUT %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
+                        action, sym, price, pnl["total_pnl_usdt"], pnl["total_pnl_pct"])
+            _notify_close(pos, price, "timeout", pnl)
+            continue
 
 
 def _notify_close(pos: Dict, exit_price: float, reason: str, pnl: Dict) -> None:
@@ -253,7 +292,7 @@ def build_report(positions: List[Dict], prices: Dict[str, float]) -> str:
     if not positions:
         lines.append("\U0001f4c2 <b>Sin posiciones abiertas</b>")
     else:
-        lines.append(f"\U0001f4c2 <b>Posiciones abiertas ({len(positions)}/{AUTO_TRADING_CAPITAL_USDT and 3}):</b>")
+        lines.append(f"\U0001f4c2 <b>Posiciones abiertas ({len(positions)}/{AUTO_TRADING_MAX_POSITIONS}):</b>")
         total_unrealized = 0.0
 
         for pos in positions:
@@ -323,3 +362,20 @@ def send_positions_report() -> None:
         logger.info("[auto-trading] Reporte de posiciones enviado")
     except Exception as exc:
         logger.warning("[auto-trading] Error en reporte de posiciones: %s", exc)
+
+
+def log_pnl_overview() -> None:
+    """Registra en el log el PnL acumulado realizado por categoría: futures, spot y micro-scalping."""
+    try:
+        pnl = database.get_pnl_overview()
+        f, s, m = pnl["futures"], pnl["spot"], pnl["micro_scalp"]
+        logger.info(
+            "[pnl] Futures: %+.2f$ (%d cerradas, %d abiertas, WR %.1f%%) | "
+            "Spot: %+.2f$ (%d cerradas, %d abiertas, WR %.1f%%) | "
+            "Micro-scalp: %+.2f%% acum (%d cerradas, %d abiertas, WR %.1f%%)",
+            f["pnl_usdt"], f["closed"], f["open"], f["winrate_pct"],
+            s["pnl_usdt"], s["closed"], s["open"], s["winrate_pct"],
+            m["pnl_pct_total"], m["closed"], m["open"], m["winrate_pct"],
+        )
+    except Exception:
+        logger.exception("Error en log_pnl_overview")

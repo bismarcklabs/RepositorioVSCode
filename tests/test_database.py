@@ -100,6 +100,31 @@ def _make_alert(sym="BTCUSDT"):
     }
 
 
+def _make_micro_alert(sym="BTCUSDT"):
+    return {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "symbol": sym,
+        "action": "MICRO_LONG_SCALP",
+        "score": 82,
+        "confidence": 85,
+        "setup": {
+            "entry": 100.0,
+            "take_profit_1": 100.3,
+            "take_profit_2": 100.6,
+            "stop_loss": 99.75,
+            "timeout_minutes": 10,
+        },
+        "technical": {"return_3m": 0.12, "return_5m": 0.25, "relative_volume": 2.5},
+        "metrics": {"delta": 100, "cvd_15m": 300},
+        "footprint": {"footprint_delta": 80},
+        "orderbook": {"imbalance": 0.2},
+        "oi_change_pct": 1.5,
+        "funding": 0.0001,
+        "reasons": ["micro impulso"],
+        "warnings": [],
+    }
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────
 
 def test_tables_created(fresh_db):
@@ -111,6 +136,34 @@ def test_tables_created(fresh_db):
     assert "trade_alerts" in tables
     assert "notification_log" in tables
     assert "alert_outcomes" in tables
+    assert "micro_scalp_alerts" in tables
+    assert "micro_notification_log" in tables
+    assert "news_events" in tables
+    assert "news_predictions" in tables
+    assert "security_event_alerts" in tables
+
+
+def test_security_alert_only_notifies_on_new_or_escalated_event(fresh_db):
+    alert = {
+        "fingerprint": "zec-security-2026-06-02",
+        "symbol": "ZECUSDT",
+        "severity": "HIGH",
+        "confirmation_status": "UNCONFIRMED",
+        "security_score": -18,
+        "source_count": 1,
+        "official_source_count": 0,
+        "first_published_at": "2026-06-02T05:43:55",
+        "title": "Time-critical upgrade",
+    }
+    first = fresh_db.upsert_security_event_alert(alert)
+    repeated = fresh_db.upsert_security_event_alert(alert)
+    alert["confirmation_status"] = "CONFIRMED"
+    alert["official_source_count"] = 1
+    escalated = fresh_db.upsert_security_event_alert(alert)
+
+    assert first["should_notify"] is True
+    assert repeated["should_notify"] is False
+    assert escalated["should_notify"] is True
 
 
 def test_wal_mode(fresh_db):
@@ -157,6 +210,28 @@ def test_insert_notification_log(fresh_db):
     assert row is not None
     assert row["ok"] == 1
     assert row["channel"] == "discord"
+
+
+def test_micro_scalp_alert_lifecycle(fresh_db):
+    micro_id = fresh_db.insert_micro_scalp_alert(_make_micro_alert())
+    assert isinstance(micro_id, int) and micro_id > 0
+
+    fresh_db.insert_micro_notification_log(micro_id, "BTCUSDT", "MICRO_LONG_SCALP", "telegram", True)
+    notif = fresh_db._get_conn().execute(
+        "SELECT * FROM micro_notification_log WHERE micro_alert_id=?", (micro_id,)
+    ).fetchone()
+    assert notif is not None
+    assert notif["ok"] == 1
+
+    fresh_db.close_micro_scalp_alert(
+        micro_id, "win", 100.7, True, True, False, 0.7, 0.8, 0.1
+    )
+    row = fresh_db._get_conn().execute(
+        "SELECT * FROM micro_scalp_alerts WHERE id=?", (micro_id,)
+    ).fetchone()
+    assert row["status"] == "closed"
+    assert row["outcome"] == "win"
+    assert row["hit_tp2"] == 1
 
 
 def test_update_alert_status(fresh_db):
@@ -212,3 +287,25 @@ def test_snapshot_retention_purge(fresh_db, monkeypatch):
     fresh_db.insert_snapshots_batch([_make_snapshot()])
     deleted = fresh_db.purge_old_snapshots()
     assert deleted >= 0  # purge corrió sin error
+
+
+def test_get_news_dashboard_returns_latest_prediction_and_events(fresh_db):
+    event = {
+        "event_id": "dashboard-news-1", "symbol": "BTCUSDT", "source": "rss",
+        "source_domain": "example.com", "title": "Bitcoin rallies after adoption news",
+        "summary": "Institutional adoption grows", "url": "https://example.com/btc",
+        "published_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "event_type": "adoption", "sentiment_score": 8, "weighted_score": 6,
+        "prediction": "BULLISH", "credibility": 0.8, "event_types": ["adoption"],
+    }
+    fresh_db.insert_news_events([event])
+    fresh_db.insert_news_prediction({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "symbol": "BTCUSDT", "prediction": "BULLISH", "sentiment_score": 8,
+        "confidence": 75, "news_count": 1, "positive_count": 1,
+        "negative_count": 0, "contradictory": False, "top_events": [event],
+        "price_at_prediction": 100, "horizon_minutes": 60,
+    })
+    data = fresh_db.get_news_dashboard(since_hours=24)
+    assert data["predictions"][0]["prediction"] == "BULLISH"
+    assert data["events"][0]["title"] == event["title"]

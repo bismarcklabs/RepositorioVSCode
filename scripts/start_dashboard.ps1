@@ -15,7 +15,7 @@ New-Item -ItemType Directory -Force -Path "$ROOT\logs"  | Out-Null
 
 Write-Host "[start_dashboard] Lanzando Streamlit en http://localhost:8501" -ForegroundColor Cyan
 
-streamlit run app/main.py `
+& "$ROOT\venv\Scripts\python.exe" -m streamlit run app/main.py `
     --server.address=0.0.0.0 `
     --server.port=8501 `
     --server.headless=true `

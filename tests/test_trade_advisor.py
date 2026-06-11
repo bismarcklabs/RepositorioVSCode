@@ -24,7 +24,7 @@ _BEARISH_TECHNICAL = {
 
 
 def _rec(signal, score, funding=0.0002, oi=50_000.0, risk="low",
-         technical=None, volume_profile=None, price=50_000.0):
+         technical=None, volume_profile=None, price=50_000.0, market_regime=None):
     technical = technical or _BASE_TECHNICAL
     score_data = {"score": score, "warnings": [], "reasons": ["Señal fuerte", "CVD positivo"]}
     alert_report = {"risk": {"risk_level": risk}} if risk != "low" else None
@@ -38,6 +38,7 @@ def _rec(signal, score, funding=0.0002, oi=50_000.0, risk="low",
         price=price,
         alert_report=alert_report,
         volume_profile=volume_profile,
+        market_regime=market_regime,
     )
 
 
@@ -150,6 +151,25 @@ def test_setup_has_entry_stop_tp_when_actionable():
     assert setup["risk_reward_1"] > 0.0
 
 
+def test_futures_setup_uses_futures_price_for_levels():
+    score_data = {"score": MIN_ALERT_SCORE_LONG_FUTURES, "warnings": [], "reasons": []}
+    result = build_trade_recommendation(
+        symbol="BTCUSDT",
+        signal="accumulation",
+        score_data=score_data,
+        technical=_BASE_TECHNICAL,
+        funding=0.0002,
+        open_interest=1.0,
+        price=100.0,
+        futures_price=110.0,
+    )
+    assert result["action"] == "LONG_FUTURES"
+    setup = result["setup"]
+    assert setup["entry"] == 110.0
+    assert setup["take_profit_1"] > setup["entry"]
+    assert setup["stop_loss"] < setup["entry"]
+
+
 def test_setup_is_none_when_wait():
     result = _rec("accumulation", score=MIN_ALERT_SCORE_BUY_SPOT - 10)
     assert result["action"] == "WAIT"
@@ -178,3 +198,31 @@ def test_setup_stop_above_entry_for_short():
     assert result["action"] == "SHORT_FUTURES"
     setup = result["setup"]
     assert setup["stop_loss"] > setup["entry"]
+
+
+def test_btc_risk_on_blocks_weak_short():
+    regime = {"active": True, "regime": "BTC_RISK_ON"}
+    result = _rec(
+        "distribution",
+        score=MIN_ALERT_SCORE_SHORT_FUTURES,
+        funding=0.0005,
+        oi=1.0,
+        technical=_BEARISH_TECHNICAL,
+        market_regime=regime,
+    )
+    assert result["action"] == "WAIT"
+    assert any("BTC_RISK_ON" in w for w in result["warnings"])
+
+
+def test_btc_risk_off_blocks_weak_long():
+    regime = {"active": True, "regime": "BTC_RISK_OFF"}
+    result = _rec(
+        "accumulation",
+        score=MIN_ALERT_SCORE_LONG_FUTURES,
+        funding=0.0002,
+        oi=1.0,
+        technical=_BASE_TECHNICAL,
+        market_regime=regime,
+    )
+    assert result["action"] == "WAIT"
+    assert any("BTC_RISK_OFF" in w for w in result["warnings"])

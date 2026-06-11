@@ -264,6 +264,18 @@ def dispatch_report(msg_discord: str, msg_telegram: str) -> None:
             logger.warning("[telegram] error enviando reporte: %s", exc)
 
 
+def dispatch_attention_alert(
+    symbol: str,
+    action: str,
+    msg_discord: str,
+    msg_telegram: str,
+) -> None:
+    """Alerta informativa prioritaria; no pasa por auto-trading."""
+    _send_discord(None, symbol, action, msg_discord)
+    _send_telegram(None, symbol, action, msg_telegram)
+    _send_email(None, symbol, action, msg_discord)
+
+
 def dispatch_alert(
     symbol: str,
     action: str,
@@ -282,3 +294,98 @@ def dispatch_alert(
     _send_discord(alert_id, symbol, action, msg_discord)
     _send_telegram(alert_id, symbol, action, msg_telegram)
     _send_email(alert_id, symbol, action, msg_discord)
+
+
+def _build_micro_message_discord(alert: Dict[str, Any]) -> str:
+    setup = alert.get("setup") or {}
+    technical = alert.get("technical") or {}
+    metrics = alert.get("metrics") or {}
+    orderbook = alert.get("orderbook") or {}
+    lines = [
+        f"! **{alert.get('action')}** - {alert.get('symbol')}",
+        f"Score: {alert.get('score', 0)} | Confianza: {alert.get('confidence', 0)}%",
+        f"Entrada: {setup.get('entry', 0):.6g}",
+        f"TP1: {setup.get('take_profit_1', 0):.6g} | TP2: {setup.get('take_profit_2', 0):.6g}",
+        f"SL: {setup.get('stop_loss', 0):.6g} | Timeout: {setup.get('timeout_minutes', 0)}m",
+        "",
+        f"5m: {technical.get('return_5m', 0):+.2f}% | 3m: {technical.get('return_3m', 0):+.2f}%",
+        f"RVOL: {technical.get('relative_volume', 1):.1f}x | OBI: {orderbook.get('imbalance', 0):+.2f}",
+        f"Delta: {metrics.get('delta', 0):+.0f} | CVD 15m: {metrics.get('cvd_15m', 0):+.0f}",
+    ]
+    reasons = alert.get("reasons") or []
+    if reasons:
+        lines.append("")
+        lines.append("Razones: " + "; ".join(str(r) for r in reasons[:4]))
+    return "\n".join(lines)
+
+
+def _build_micro_message_telegram(alert: Dict[str, Any]) -> str:
+    setup = alert.get("setup") or {}
+    technical = alert.get("technical") or {}
+    metrics = alert.get("metrics") or {}
+    orderbook = alert.get("orderbook") or {}
+    lines = [
+        f"! <b>{alert.get('action')}</b> - {alert.get('symbol')}",
+        f"Score: {alert.get('score', 0)} | Confianza: {alert.get('confidence', 0)}%",
+        "",
+        f"Entrada: <code>{setup.get('entry', 0):.6g}</code>",
+        f"TP1: <code>{setup.get('take_profit_1', 0):.6g}</code> | TP2: <code>{setup.get('take_profit_2', 0):.6g}</code>",
+        f"SL: <code>{setup.get('stop_loss', 0):.6g}</code> | Timeout: {setup.get('timeout_minutes', 0)}m",
+        "",
+        f"5m: <b>{technical.get('return_5m', 0):+.2f}%</b> | 3m: <b>{technical.get('return_3m', 0):+.2f}%</b>",
+        f"RVOL: {technical.get('relative_volume', 1):.1f}x | OBI: {orderbook.get('imbalance', 0):+.2f}",
+        f"Delta: {metrics.get('delta', 0):+.0f} | CVD 15m: {metrics.get('cvd_15m', 0):+.0f}",
+    ]
+    reasons = alert.get("reasons") or []
+    if reasons:
+        lines.append("")
+        lines.append("Razones: " + "; ".join(str(r) for r in reasons[:4]))
+    return "\n".join(lines)
+
+
+def dispatch_micro_scalp_alert(alert: Dict[str, Any]) -> None:
+    """Envia micro-alertas sin mezclarlas con trade_alerts."""
+    symbol = alert.get("symbol", "")
+    action = alert.get("action", "")
+    micro_alert_id = alert.get("id")
+    msg_discord = _build_micro_message_discord(alert)
+    msg_telegram = _build_micro_message_telegram(alert)
+    if ENABLE_DISCORD_ALERTS and DISCORD_WEBHOOK_URL:
+        try:
+            _post_json(DISCORD_WEBHOOK_URL, {"content": msg_discord})
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "discord", ok=True)
+            logger.info("[discord] micro-alerta enviada: %s %s", symbol, action)
+        except Exception as exc:
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "discord", ok=False, error=str(exc))
+            logger.warning("[discord] micro error: %s", exc)
+
+    if ENABLE_TELEGRAM_ALERTS and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            _post_json(url, {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg_telegram,
+                "parse_mode": "HTML",
+            })
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "telegram", ok=True)
+            logger.info("[telegram] micro-alerta enviada: %s %s", symbol, action)
+        except Exception as exc:
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "telegram", ok=False, error=str(exc))
+            logger.warning("[telegram] micro error: %s", exc)
+
+    if ENABLE_EMAIL_ALERTS and SMTP_HOST and EMAIL_FROM and EMAIL_TO:
+        try:
+            msg = MIMEText(msg_discord.replace("*", ""), "plain", "utf-8")
+            msg["Subject"] = f"[Micro Scalp] {action} {symbol}"
+            msg["From"] = EMAIL_FROM
+            msg["To"] = EMAIL_TO
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=10) as server:
+                server.ehlo()
+                server.starttls()
+                if SMTP_USERNAME and SMTP_PASSWORD:
+                    server.login(SMTP_USERNAME, SMTP_PASSWORD)
+                server.sendmail(EMAIL_FROM, [EMAIL_TO], msg.as_string())
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "email", ok=True)
+        except Exception as exc:
+            database.insert_micro_notification_log(micro_alert_id, symbol, action, "email", ok=False, error=str(exc))
+            logger.warning("[email] micro error: %s", exc)

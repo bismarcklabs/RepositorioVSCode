@@ -30,6 +30,13 @@ from app.config import (
     ML_ENABLED,
     ML_THRESHOLD,
     BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE,
+    AUTO_TRADING_USE_CALIBRATED_GRADE,
+    AUTO_TRADING_ALLOWED_CALIBRATED_GRADES,
+    AUTO_TRADING_C_SHORT_MIN_SCORE,
+    AUTO_TRADING_C_LONG_MIN_SCORE,
+    AUTO_TRADING_COUNTERTREND_MIN_SCORE,
+    AUTO_TRADING_LOSS_COOLDOWN_COUNT,
+    AUTO_TRADING_LOSS_COOLDOWN_HOURS,
 )
 from app.market_regime import is_countertrend_action
 
@@ -137,7 +144,8 @@ def _passes_gates(result: Dict[str, Any],
 
     regime = result.get("market_regime") or rec.get("market_regime") or {}
     if regime.get("active") and is_countertrend_action(action, regime):
-        if score < BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE:
+        countertrend_min = max(BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE, AUTO_TRADING_COUNTERTREND_MIN_SCORE)
+        if score < countertrend_min:
             return (
                 False,
                 f"{regime.get('regime')} activo: {action} bloqueado por ir contra BTC",
@@ -160,6 +168,24 @@ def _passes_gates(result: Dict[str, Any],
     size = get_position_size_usdt(score)
     if size <= 0:
         return False, f"score {score} no alcanza ningun tier de sizing"
+
+    calibrated = result.get("setup_calibration") or rec.get("setup_calibration") or {}
+    if AUTO_TRADING_USE_CALIBRATED_GRADE and calibrated:
+        grade = calibrated.get("calibrated_grade", "NO_TRADE")
+        if grade not in AUTO_TRADING_ALLOWED_CALIBRATED_GRADES:
+            return False, f"grado calibrado {grade} no es auto-operable"
+        if grade == "C":
+            trigger_ok = bool((rec.get("setup_evaluation") or {}).get("checklist", {}).get("trigger_ok"))
+            if not trigger_ok:
+                return False, "grado C sin gatillo confirmado"
+            required = AUTO_TRADING_C_LONG_MIN_SCORE if action in ("LONG_FUTURES", "BUY_SPOT") else AUTO_TRADING_C_SHORT_MIN_SCORE
+            if score < required:
+                return False, f"grado C score {score} < min direccional {required}"
+            if action in ("LONG_FUTURES", "BUY_SPOT") and regime.get("regime") != "BTC_RISK_ON":
+                return False, "grado C long requiere BTC_RISK_ON"
+
+    if database.count_recent_auto_losses(result["symbol"], action, AUTO_TRADING_LOSS_COOLDOWN_HOURS) >= AUTO_TRADING_LOSS_COOLDOWN_COUNT:
+        return False, "cooldown por perdidas consecutivas recientes"
 
     # Gate de setup grade — usa el mismo flag que controla el scanner
     if ENABLE_SETUP_GATE:

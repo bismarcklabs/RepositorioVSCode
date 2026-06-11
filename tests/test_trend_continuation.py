@@ -15,6 +15,7 @@ _LONG_SNAP = {
         "above_vwap":       True,
         "return_1h":        3.0,
         "return_15m":       1.0,
+        "return_5m":        0.4,
         "relative_volume":  1.8,
         "vwap_distance_pct": 3.0,
     },
@@ -29,6 +30,7 @@ _SHORT_SNAP = {
         "above_vwap":       False,
         "return_1h":        -3.0,
         "return_15m":       -1.0,
+        "return_5m":        -0.4,
         "relative_volume":  1.8,
         "vwap_distance_pct": -3.0,
     },
@@ -97,6 +99,14 @@ def test_long_weak_return_15m_fails():
     snap = {
         **_LONG_SNAP,
         "technical": {**_LONG_SNAP["technical"], "return_15m": 0.3},
+    }
+    assert is_long_momentum_continuation(snap) is False
+
+
+def test_long_weak_return_5m_fails():
+    snap = {
+        **_LONG_SNAP,
+        "technical": {**_LONG_SNAP["technical"], "return_5m": 0.0},
     }
     assert is_long_momentum_continuation(snap) is False
 

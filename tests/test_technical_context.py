@@ -26,6 +26,8 @@ def test_flat_market_neutral_trend(mock_klines):
     assert ctx["trend_bias"] == "neutral"
     assert ctx["return_1h"] == pytest.approx(0.0, abs=1e-3)
     assert ctx["return_15m"] == pytest.approx(0.0, abs=1e-3)
+    assert ctx["return_5m"] == pytest.approx(0.0, abs=1e-3)
+    assert ctx["return_3m"] == pytest.approx(0.0, abs=1e-3)
     assert ctx["relative_volume"] == pytest.approx(1.0, abs=0.01)
 
 
@@ -59,7 +61,7 @@ def test_returns_default_on_insufficient_data(mock_klines):
 def test_result_has_required_keys(mock_klines):
     mock_klines.return_value = _flat_klines()
     ctx = get_technical_context("BTCUSDT")
-    for key in ("return_15m", "return_1h", "ema_20", "ema_50", "vwap", "vwap_distance_pct", "relative_volume", "trend_bias"):
+    for key in ("return_3m", "return_5m", "return_15m", "return_1h", "ema_20", "ema_50", "vwap", "vwap_distance_pct", "relative_volume", "trend_bias"):
         assert key in ctx
 
 

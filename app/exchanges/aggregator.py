@@ -4,8 +4,12 @@ Reglas de operación:
   - Binance = fuente primaria. Si Binance falla, el snapshot retorna ok=False.
   - Coinbase / Kraken = confirmación externa. Si fallan, no bloquean.
   - multi_exchange_confidence = None cuando no hay datos externos (sin penalización al scoring).
+  - external_trend = dirección detectada en exchanges externos (bullish/bearish/neutral).
+    Se calcula acumulando historial de precios en memoria entre ciclos del scanner.
 """
 import logging
+import threading
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +28,59 @@ _KRAKEN   = KrakenProvider()
 
 _EXTERNAL_PROVIDERS = [_COINBASE, _KRAKEN]
 
+# ── Historial de precios en memoria para detectar tendencia externa ────────
+# key = "exchange:normalized_symbol"  value = deque de precios (float)
+# maxlen=20 ≈ 5 minutos de historial a 15s/ciclo
+_price_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=20))
+_history_lock = threading.Lock()
+
+_TREND_LOOKBACK   = 5     # ciclos hacia atrás para calcular retorno (~75s)
+_TREND_MIN_RETURN = 0.08  # % mínimo para considerar movimiento direccional
+
+
+def _compute_external_trend(
+    tickers: Dict[str, ExchangeTicker],
+    normalized: str,
+) -> Dict[str, Any]:
+    """Actualiza el historial de precios y calcula retorno + tendencia por exchange externo.
+
+    Retorna:
+        external_returns  — dict[exchange_name, return_pct]  (vacío si sin historial)
+        external_trend    — "bullish" | "bearish" | "neutral" | None (None = sin datos)
+        external_trend_count — cuántos exchanges externos coinciden en la dirección
+    """
+    external_returns: Dict[str, float] = {}
+
+    for name, ticker in tickers.items():
+        if name == "binance" or not (ticker.ok and ticker.price):
+            continue
+        key = f"{name}:{normalized}"
+        with _history_lock:
+            hist = _price_history[key]
+            old_price = hist[-_TREND_LOOKBACK] if len(hist) >= _TREND_LOOKBACK else None
+            hist.append(ticker.price)
+        if old_price and old_price > 0:
+            external_returns[name] = round((ticker.price - old_price) / old_price * 100.0, 4)
+
+    if not external_returns:
+        return {"external_returns": {}, "external_trend": None, "external_trend_count": 0}
+
+    bullish_n = sum(1 for r in external_returns.values() if r >= _TREND_MIN_RETURN)
+    bearish_n = sum(1 for r in external_returns.values() if r <= -_TREND_MIN_RETURN)
+
+    if bullish_n > bearish_n:
+        trend, count = "bullish", bullish_n
+    elif bearish_n > bullish_n:
+        trend, count = "bearish", bearish_n
+    else:
+        trend, count = "neutral", 0
+
+    return {
+        "external_returns":      external_returns,
+        "external_trend":        trend,
+        "external_trend_count":  count,
+    }
+
 
 def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
                              normalized: str) -> Dict[str, Any]:
@@ -34,6 +91,9 @@ def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
       exchange_availability_score  — 0-100, % de exchanges externos que respondieron
       price_deviation_pct          — None si < 2 precios disponibles
       multi_exchange_confidence    — None si sin datos externos (no penalizar en scoring)
+      external_trend               — "bullish" | "bearish" | "neutral" | None
+      external_trend_count         — cuántos exchanges confirman la tendencia
+      external_returns             — dict[exchange, return_pct]
       warnings                     — lista de strings
     """
     external_ok: List[ExchangeTicker] = [
@@ -43,12 +103,15 @@ def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
     total_external = len(_EXTERNAL_PROVIDERS)
     availability = len(external_ok) / total_external * 100 if total_external else 0.0
 
+    trend_data = _compute_external_trend(tickers, normalized)
+
     if not external_ok:
         return {
             "exchange_availability_score": round(availability, 1),
             "price_deviation_pct": None,
             "multi_exchange_confidence": None,
             "warnings": [],
+            **trend_data,
         }
 
     # Precios disponibles incluyendo Binance
@@ -61,6 +124,7 @@ def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
             "price_deviation_pct": None,
             "multi_exchange_confidence": None,
             "warnings": [],
+            **trend_data,
         }
 
     min_p = min(prices)
@@ -99,6 +163,7 @@ def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
         "price_deviation_pct": round(deviation_pct, 4),
         "multi_exchange_confidence": multi_conf,
         "warnings": warnings,
+        **trend_data,
     }
 
 
@@ -144,6 +209,9 @@ def get_multi_exchange_snapshot(binance_symbol: str,
             "exchange_availability_score": 0.0,
             "price_deviation_pct": None,
             "multi_exchange_confidence": None,
+            "external_trend": None,
+            "external_trend_count": 0,
+            "external_returns": {},
             "warnings": [f"Binance no disponible: {binance_ticker.error}"],
             "external_supported": is_supported(normalized_symbol),
         }
@@ -183,6 +251,9 @@ def get_multi_exchange_snapshot(binance_symbol: str,
         "exchange_availability_score": confirmation["exchange_availability_score"],
         "price_deviation_pct": confirmation["price_deviation_pct"],
         "multi_exchange_confidence": confirmation["multi_exchange_confidence"],
+        "external_trend": confirmation["external_trend"],
+        "external_trend_count": confirmation["external_trend_count"],
+        "external_returns": confirmation["external_returns"],
         "warnings": confirmation["warnings"],
         "external_supported": external_supported,
     }

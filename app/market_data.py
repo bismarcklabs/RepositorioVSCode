@@ -119,11 +119,32 @@ def get_orderbook_raw(symbol: str, limit: int = 20) -> Dict:
     return data if isinstance(data, dict) else {"bids": [], "asks": []}
 
 
-def get_klines(symbol: str, interval: str = "1m", limit: int = 60) -> List:
-    """Velas de futuros. TTL 30s."""
+def get_klines(
+    symbol: str,
+    interval: str = "1m",
+    limit: int = 60,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+) -> List:
+    """Velas de futuros.
+
+    Si se pasan start_time_ms/end_time_ms, obtiene una ventana historica exacta.
+    Eso evita que los outcome trackers pierdan alertas antiguas al consultar solo
+    las ultimas velas.
+    """
+    params: Dict[str, Any] = {
+        "symbol": symbol.upper(),
+        "interval": interval,
+        "limit": limit,
+    }
+    if start_time_ms is not None:
+        params["startTime"] = int(start_time_ms)
+    if end_time_ms is not None:
+        params["endTime"] = int(end_time_ms)
+
     data = _fetch(
         f"{_FUTURES_BASE}/fapi/v1/klines",
-        params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+        params=params,
         ttl=30.0,
     )
     return data if isinstance(data, list) else []

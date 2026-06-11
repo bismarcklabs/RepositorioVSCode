@@ -7,6 +7,7 @@ Diseño:
 - Inserciones de snapshots en batch (un executemany por ciclo de scan).
 """
 
+import calendar
 import json
 import logging
 import sqlite3
@@ -56,6 +57,8 @@ def _migrate_schema() -> None:
     """
     conn = _get_conn()
     new_columns = [
+        ("market_snapshots", "return_3m",            "REAL DEFAULT 0"),
+        ("market_snapshots", "return_5m",            "REAL DEFAULT 0"),
         ("market_snapshots", "cvd_15m",              "REAL DEFAULT 0"),
         ("market_snapshots", "atr",                  "REAL DEFAULT 0"),
         ("market_snapshots", "atr_pct",              "REAL DEFAULT 0"),
@@ -100,6 +103,24 @@ def _migrate_schema() -> None:
         # trend continuation en trade_alerts (sobrevive purga de 7 días)
         ("trade_alerts", "setup_route",          "TEXT DEFAULT ''"),
         ("trade_alerts", "trend_priority_score", "INTEGER DEFAULT 0"),
+        ("trade_alerts", "original_setup_grade", "TEXT DEFAULT ''"),
+        ("trade_alerts", "calibrated_grade",     "TEXT DEFAULT ''"),
+        ("trade_alerts", "direction_score",      "INTEGER DEFAULT 0"),
+        ("trade_alerts", "entry_score",          "INTEGER DEFAULT 0"),
+        ("trade_alerts", "risk_score",           "INTEGER DEFAULT 0"),
+        ("trade_alerts", "calibration_version",  "TEXT DEFAULT ''"),
+        ("trade_alerts", "btc_regime",           "TEXT DEFAULT 'NORMAL'"),
+        ("trade_alerts", "watch_type",           "TEXT DEFAULT ''"),
+        # micro-scalp outcomes
+        ("micro_scalp_alerts", "close_time",       "TEXT"),
+        ("micro_scalp_alerts", "exit_price",       "REAL"),
+        ("micro_scalp_alerts", "outcome",          "TEXT DEFAULT 'open'"),
+        ("micro_scalp_alerts", "hit_tp1",          "INTEGER DEFAULT 0"),
+        ("micro_scalp_alerts", "hit_tp2",          "INTEGER DEFAULT 0"),
+        ("micro_scalp_alerts", "hit_stop",         "INTEGER DEFAULT 0"),
+        ("micro_scalp_alerts", "pnl_pct",          "REAL DEFAULT 0"),
+        ("micro_scalp_alerts", "max_favorable_pct","REAL DEFAULT 0"),
+        ("micro_scalp_alerts", "max_adverse_pct",  "REAL DEFAULT 0"),
     ]
     for table, col, col_def in new_columns:
         try:
@@ -140,6 +161,8 @@ def init_db() -> None:
                     imbalance       REAL,
                     spread_pct      REAL,
 
+                    return_3m       REAL,
+                    return_5m       REAL,
                     return_15m      REAL,
                     return_1h       REAL,
                     vwap            REAL,
@@ -309,6 +332,122 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_mexmetrics_sym_ts
                     ON multi_exchange_metrics(binance_symbol, timestamp);
+
+                CREATE TABLE IF NOT EXISTS micro_scalp_alerts (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    symbol          TEXT    NOT NULL,
+                    action          TEXT    NOT NULL,
+                    score           INTEGER NOT NULL,
+                    confidence      INTEGER DEFAULT 0,
+                    entry           REAL,
+                    take_profit_1   REAL,
+                    take_profit_2   REAL,
+                    stop_loss       REAL,
+                    timeout_minutes INTEGER DEFAULT 10,
+                    return_3m       REAL DEFAULT 0,
+                    return_5m       REAL DEFAULT 0,
+                    relative_volume REAL DEFAULT 1,
+                    delta           REAL DEFAULT 0,
+                    cvd_15m         REAL DEFAULT 0,
+                    footprint_delta REAL DEFAULT 0,
+                    imbalance       REAL DEFAULT 0,
+                    oi_change_pct   REAL DEFAULT 0,
+                    funding         REAL DEFAULT 0,
+                    status          TEXT DEFAULT 'open',
+                    close_time      TEXT,
+                    exit_price      REAL,
+                    outcome         TEXT DEFAULT 'open',
+                    hit_tp1         INTEGER DEFAULT 0,
+                    hit_tp2         INTEGER DEFAULT 0,
+                    hit_stop        INTEGER DEFAULT 0,
+                    pnl_pct         REAL DEFAULT 0,
+                    max_favorable_pct REAL DEFAULT 0,
+                    max_adverse_pct REAL DEFAULT 0,
+                    reasons_json    TEXT DEFAULT '[]',
+                    warnings_json   TEXT DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_micro_scalp_sym_ts
+                    ON micro_scalp_alerts(symbol, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_micro_scalp_status
+                    ON micro_scalp_alerts(status);
+
+                CREATE TABLE IF NOT EXISTS micro_notification_log (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp       TEXT    NOT NULL,
+                    micro_alert_id  INTEGER REFERENCES micro_scalp_alerts(id),
+                    symbol          TEXT    NOT NULL,
+                    action          TEXT    NOT NULL,
+                    channel         TEXT    NOT NULL,
+                    ok              INTEGER NOT NULL,
+                    error           TEXT DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_micro_notif_alert_id
+                    ON micro_notification_log(micro_alert_id);
+
+                CREATE TABLE IF NOT EXISTS news_events (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id        TEXT NOT NULL UNIQUE,
+                    symbol          TEXT NOT NULL,
+                    source          TEXT NOT NULL,
+                    source_domain   TEXT DEFAULT '',
+                    title           TEXT NOT NULL,
+                    summary         TEXT DEFAULT '',
+                    url             TEXT DEFAULT '',
+                    published_at    TEXT NOT NULL,
+                    collected_at    TEXT NOT NULL,
+                    event_type      TEXT DEFAULT 'general',
+                    sentiment_score REAL DEFAULT 0,
+                    weighted_score  REAL DEFAULT 0,
+                    prediction      TEXT DEFAULT 'NEUTRAL',
+                    credibility     REAL DEFAULT 0,
+                    event_types_json TEXT DEFAULT '[]'
+                );
+                CREATE INDEX IF NOT EXISTS idx_news_events_sym_ts
+                    ON news_events(symbol, published_at);
+
+                CREATE TABLE IF NOT EXISTS news_predictions (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp           TEXT NOT NULL,
+                    symbol              TEXT NOT NULL,
+                    prediction          TEXT NOT NULL,
+                    sentiment_score     REAL DEFAULT 0,
+                    confidence          INTEGER DEFAULT 0,
+                    news_count          INTEGER DEFAULT 0,
+                    positive_count      INTEGER DEFAULT 0,
+                    negative_count      INTEGER DEFAULT 0,
+                    contradictory       INTEGER DEFAULT 0,
+                    top_events_json     TEXT DEFAULT '[]',
+                    price_at_prediction REAL,
+                    horizon_minutes     INTEGER DEFAULT 60,
+                    evaluated_at        TEXT,
+                    price_at_outcome    REAL,
+                    return_pct          REAL,
+                    outcome             TEXT DEFAULT 'open'
+                );
+                CREATE INDEX IF NOT EXISTS idx_news_predictions_status
+                    ON news_predictions(outcome, timestamp);
+                CREATE INDEX IF NOT EXISTS idx_news_predictions_sym_ts
+                    ON news_predictions(symbol, timestamp);
+
+                CREATE TABLE IF NOT EXISTS security_event_alerts (
+                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint           TEXT NOT NULL UNIQUE,
+                    created_at            TEXT NOT NULL,
+                    updated_at            TEXT NOT NULL,
+                    symbol                TEXT NOT NULL,
+                    severity              TEXT NOT NULL,
+                    confirmation_status   TEXT NOT NULL,
+                    security_score        REAL DEFAULT 0,
+                    source_count          INTEGER DEFAULT 0,
+                    official_source_count INTEGER DEFAULT 0,
+                    first_published_at    TEXT,
+                    title                 TEXT NOT NULL,
+                    analysis_json         TEXT DEFAULT '{}',
+                    last_notified_at      TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_security_alerts_sym_ts
+                    ON security_event_alerts(symbol, created_at);
             """)
             conn.commit()
             _migrate_schema()
@@ -355,6 +494,8 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
         ob.get("imbalance", 0.0),
         ob.get("spread_pct", 0.0),
         # technical
+        tech.get("return_3m", 0.0),
+        tech.get("return_5m", 0.0),
         tech.get("return_15m", 0.0),
         tech.get("return_1h", 0.0),
         tech.get("vwap", 0.0),
@@ -438,7 +579,7 @@ _SNAPSHOT_INSERT = """
         action, market, confidence, score, signal, risk_level,
         delta, cvd, buy_volume, sell_volume, funding, open_interest,
         imbalance, spread_pct,
-        return_15m, return_1h, vwap, vwap_distance_pct, above_vwap,
+        return_3m, return_5m, return_15m, return_1h, vwap, vwap_distance_pct, above_vwap,
         relative_volume, trend_bias,
         poc, nearest_vp_level, nearest_vp_type, vp_distance,
         footprint_delta, absorption_buy, absorption_sell,
@@ -460,7 +601,7 @@ _SNAPSHOT_INSERT = """
     ) VALUES (
         ?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,
-        ?,?,?,?,?,?,?,
+        ?,?,?,?,?,?,?,?,?,
         ?,?,?,?,
         ?,?,?,?,?,
         ?,?,?,?,?,
@@ -513,8 +654,10 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
                  setup_grade, setup_score, trigger_type,
                  ml_probability, ml_filtered,
                  setup_route, trend_priority_score,
+                 original_setup_grade, calibrated_grade, direction_score,
+                 entry_score, risk_score, calibration_version, btc_regime, watch_type,
                  status)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
             """,
             (
                 data.get("timestamp", ""),
@@ -537,6 +680,14 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
                 int(data.get("ml_filtered", False)),
                 data.get("setup_route", ""),
                 data.get("trend_priority_score", 0),
+                data.get("original_setup_grade", data.get("setup_grade", "")),
+                data.get("calibrated_grade", ""),
+                data.get("direction_score", 0),
+                data.get("entry_score", 0),
+                data.get("risk_score", 0),
+                data.get("calibration_version", ""),
+                data.get("btc_regime", "NORMAL"),
+                data.get("watch_type", ""),
             ),
         )
         conn.commit()
@@ -544,6 +695,108 @@ def insert_trade_alert(data: Dict[str, Any]) -> Optional[int]:
     except Exception:
         logger.exception("Error al insertar trade_alert")
         return None
+
+
+def insert_micro_scalp_alert(data: Dict[str, Any]) -> Optional[int]:
+    """Inserta una alerta de scalping agresivo. Retorna micro_alert_id o None."""
+    setup = data.get("setup") or {}
+    technical = data.get("technical") or {}
+    metrics = data.get("metrics") or {}
+    footprint = data.get("footprint") or {}
+    orderbook = data.get("orderbook") or {}
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """
+            INSERT INTO micro_scalp_alerts
+                (timestamp, symbol, action, score, confidence,
+                 entry, take_profit_1, take_profit_2, stop_loss, timeout_minutes,
+                 return_3m, return_5m, relative_volume,
+                 delta, cvd_15m, footprint_delta, imbalance,
+                 oi_change_pct, funding, status, reasons_json, warnings_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?)
+            """,
+            (
+                data.get("timestamp", ""),
+                data.get("symbol", ""),
+                data.get("action", ""),
+                data.get("score", 0),
+                data.get("confidence", 0),
+                setup.get("entry", 0.0),
+                setup.get("take_profit_1", 0.0),
+                setup.get("take_profit_2", 0.0),
+                setup.get("stop_loss", 0.0),
+                setup.get("timeout_minutes", 0),
+                technical.get("return_3m", 0.0),
+                technical.get("return_5m", 0.0),
+                technical.get("relative_volume", 1.0),
+                metrics.get("delta", 0.0),
+                metrics.get("cvd_15m", 0.0),
+                footprint.get("footprint_delta", 0.0),
+                orderbook.get("imbalance", 0.0),
+                data.get("oi_change_pct", 0.0),
+                data.get("funding", 0.0),
+                json.dumps(data.get("reasons", [])),
+                json.dumps(data.get("warnings", [])),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        logger.exception("Error al insertar micro_scalp_alert")
+        return None
+
+
+def get_open_micro_scalp_alerts() -> List[Dict[str, Any]]:
+    try:
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT * FROM micro_scalp_alerts WHERE status='open' ORDER BY timestamp ASC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception:
+        logger.exception("Error al obtener micro_scalp_alerts abiertas")
+        return []
+
+
+def close_micro_scalp_alert(
+    micro_alert_id: int,
+    outcome: str,
+    exit_price: float,
+    hit_tp1: bool,
+    hit_tp2: bool,
+    hit_stop: bool,
+    pnl_pct: float,
+    max_favorable_pct: float,
+    max_adverse_pct: float,
+) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            UPDATE micro_scalp_alerts SET
+                status = 'closed',
+                close_time = ?,
+                exit_price = ?,
+                outcome = ?,
+                hit_tp1 = ?,
+                hit_tp2 = ?,
+                hit_stop = ?,
+                pnl_pct = ?,
+                max_favorable_pct = ?,
+                max_adverse_pct = ?
+            WHERE id = ?
+            """,
+            (
+                _now_iso(), exit_price, outcome,
+                int(hit_tp1), int(hit_tp2), int(hit_stop),
+                pnl_pct, max_favorable_pct, max_adverse_pct,
+                micro_alert_id,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error al cerrar micro_scalp_alert %d", micro_alert_id)
 
 
 def update_alert_status(alert_id: int, status: str) -> None:
@@ -591,6 +844,29 @@ def insert_notification_log(
         conn.commit()
     except Exception:
         logger.exception("Error al insertar notification_log")
+
+
+def insert_micro_notification_log(
+    micro_alert_id: Optional[int],
+    symbol: str,
+    action: str,
+    channel: str,
+    ok: bool,
+    error: str = "",
+) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            INSERT INTO micro_notification_log
+                (timestamp, micro_alert_id, symbol, action, channel, ok, error)
+            VALUES (?,?,?,?,?,?,?)
+            """,
+            (_now_iso(), micro_alert_id, symbol, action, channel, int(ok), error),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error al insertar micro_notification_log")
 
 
 # ── Cooldown persistente ──────────────────────────────────────────────────
@@ -1009,6 +1285,112 @@ def get_winrate_summary(since_hours: float = 24.0) -> Dict[str, Any]:
         return empty
 
 
+def get_micro_scalp_summary(since_hours: float = 12.0) -> Dict[str, Any]:
+    """Resumen de win rate para micro_scalp_alerts cerradas en las últimas N horas."""
+    empty: Dict[str, Any] = {
+        "since_hours": since_hours,
+        "total": 0,
+        "by_action": [],
+        "top_symbols": [],
+        "global_winrate_pct": 0.0,
+        "global_avg_pnl_pct": 0.0,
+    }
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+
+        by_action = conn.execute(
+            """
+            SELECT action,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN outcome = 'win'     THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN outcome = 'partial' THEN 1 ELSE 0 END) AS partials,
+                   SUM(CASE WHEN outcome = 'loss'    THEN 1 ELSE 0 END) AS losses,
+                   SUM(CASE WHEN outcome NOT IN ('win','partial','loss') THEN 1 ELSE 0 END) AS neutrals,
+                   AVG(score) AS avg_score,
+                   AVG(CASE WHEN outcome IN ('win','partial','loss') THEN pnl_pct   ELSE NULL END) AS avg_pnl_pct,
+                   AVG(CASE WHEN outcome IN ('win','partial','loss') THEN max_favorable_pct ELSE NULL END) AS avg_mfe,
+                   AVG(CASE WHEN outcome IN ('win','partial','loss') THEN max_adverse_pct  ELSE NULL END) AS avg_mae
+            FROM micro_scalp_alerts
+            WHERE status = 'closed' AND timestamp >= ?
+            GROUP BY action
+            ORDER BY total DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        top_symbols = conn.execute(
+            """
+            SELECT symbol, action,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN outcome IN ('win','partial') THEN 1 ELSE 0 END) AS wins,
+                   ROUND(100.0 * SUM(CASE WHEN outcome IN ('win','partial')
+                                          THEN 1 ELSE 0 END) / COUNT(*), 1) AS winrate_pct,
+                   AVG(pnl_pct) AS avg_pnl_pct
+            FROM micro_scalp_alerts
+            WHERE status = 'closed' AND timestamp >= ?
+            GROUP BY symbol, action
+            HAVING total >= 2
+            ORDER BY winrate_pct DESC, total DESC
+            LIMIT 5
+            """,
+            (cutoff,),
+        ).fetchall()
+
+        rows = []
+        total_all = wins_all = partials_all = evaluated_all = 0
+        pnl_vals: List[float] = []
+
+        for r in by_action:
+            total = r["total"] or 0
+            w, p, l, n = r["wins"] or 0, r["partials"] or 0, r["losses"] or 0, r["neutrals"] or 0
+            evaluated = w + p + l
+            strict_wr = round(w / evaluated * 100.0, 1) if evaluated else 0.0
+            dir_wr    = round((w + p) / evaluated * 100.0, 1) if evaluated else 0.0
+            avg_pnl   = round(r["avg_pnl_pct"] or 0.0, 3)
+            avg_mfe   = round(r["avg_mfe"] or 0.0, 3)
+            avg_mae   = round(r["avg_mae"] or 0.0, 3)
+            rows.append({
+                "action":      r["action"],
+                "total":       total,
+                "wins":        w,
+                "partials":    p,
+                "losses":      l,
+                "neutrals":    n,
+                "evaluated":   evaluated,
+                "winrate_pct": strict_wr,
+                "directional_winrate_pct": dir_wr,
+                "avg_pnl_pct": avg_pnl,
+                "avg_mfe_pct": avg_mfe,
+                "avg_mae_pct": avg_mae,
+                "avg_score":   round(r["avg_score"] or 0.0, 1),
+            })
+            total_all     += total
+            wins_all      += w
+            partials_all  += p
+            evaluated_all += evaluated
+            if r["avg_pnl_pct"] is not None:
+                pnl_vals.append(r["avg_pnl_pct"])
+
+        global_wr  = round(wins_all / evaluated_all * 100.0, 1) if evaluated_all else 0.0
+        global_dir = round((wins_all + partials_all) / evaluated_all * 100.0, 1) if evaluated_all else 0.0
+        global_pnl = round(sum(pnl_vals) / len(pnl_vals), 3) if pnl_vals else 0.0
+
+        return {
+            "since_hours":                  since_hours,
+            "total":                        total_all,
+            "total_evaluated":              evaluated_all,
+            "by_action":                    rows,
+            "top_symbols":                  [dict(r) for r in top_symbols],
+            "global_winrate_pct":           global_wr,
+            "global_directional_winrate_pct": global_dir,
+            "global_avg_pnl_pct":           global_pnl,
+        }
+    except Exception:
+        logger.exception("Error al calcular micro scalp summary")
+        return empty
+
+
 def get_win_rate_by_action() -> List[Dict[str, Any]]:
     try:
         conn = _get_conn()
@@ -1195,7 +1577,7 @@ def get_auto_positions_summary(since_hours: float = 24.0) -> Dict[str, Any]:
             COUNT(*)                                                    AS total,
             SUM(CASE WHEN close_reason = 'tp2'         THEN 1 ELSE 0 END) AS tp2_count,
             SUM(CASE WHEN close_reason = 'tp1_only'    THEN 1 ELSE 0 END) AS tp1_count,
-            SUM(CASE WHEN close_reason IN ('sl','sl_breakeven') THEN 1 ELSE 0 END) AS sl_count,
+            SUM(CASE WHEN close_reason IN ('sl','sl_breakeven','risk_cut') THEN 1 ELSE 0 END) AS sl_count,
             SUM(CASE WHEN close_reason = 'timeout'     THEN 1 ELSE 0 END) AS timeout_count,
             COALESCE(SUM(total_pnl_usdt), 0.0)                         AS total_pnl_usdt,
             COALESCE(AVG(total_pnl_pct),  0.0)                         AS avg_pnl_pct
@@ -1216,7 +1598,333 @@ def get_auto_positions_summary(since_hours: float = 24.0) -> Dict[str, Any]:
     }
 
 
+def get_pnl_overview() -> Dict[str, Any]:
+    """PnL acumulado historico (todas las fechas) por categoria: futures, spot y micro-scalping."""
+    conn = _get_conn()
+
+    def _positions_pnl(actions: tuple) -> Dict[str, Any]:
+        placeholders = ",".join("?" for _ in actions)
+        row = conn.execute(
+            f"""
+            SELECT
+                COALESCE(SUM(CASE WHEN status = 'closed' THEN total_pnl_usdt ELSE 0 END), 0.0) AS pnl_usdt,
+                SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+                SUM(CASE WHEN status = 'closed' AND total_pnl_usdt > 0 THEN 1 ELSE 0 END) AS wins,
+                SUM(CASE WHEN status = 'closed' AND total_pnl_usdt <= 0 THEN 1 ELSE 0 END) AS losses
+            FROM auto_positions
+            WHERE action IN ({placeholders})
+            """,
+            actions,
+        ).fetchone()
+        closed = row["closed"] or 0
+        wins = row["wins"] or 0
+        return {
+            "pnl_usdt": round(row["pnl_usdt"] or 0.0, 4),
+            "closed": closed,
+            "open": row["open_count"] or 0,
+            "wins": wins,
+            "losses": row["losses"] or 0,
+            "winrate_pct": round(wins / closed * 100, 2) if closed else 0.0,
+        }
+
+    futures = _positions_pnl(("LONG_FUTURES", "SHORT_FUTURES"))
+    spot = _positions_pnl(("BUY_SPOT", "SELL_SPOT"))
+
+    ms_row = conn.execute(
+        """
+        SELECT
+            COALESCE(SUM(CASE WHEN status = 'closed' THEN pnl_pct ELSE 0 END), 0.0) AS pnl_pct_total,
+            COALESCE(AVG(CASE WHEN status = 'closed' THEN pnl_pct END), 0.0) AS pnl_pct_avg,
+            SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+            SUM(CASE WHEN outcome IN ('win', 'partial') THEN 1 ELSE 0 END) AS wins,
+            SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses
+        FROM micro_scalp_alerts
+        """
+    ).fetchone()
+    ms_closed = ms_row["closed"] or 0
+    ms_wins = ms_row["wins"] or 0
+    ms_losses = ms_row["losses"] or 0
+    micro_scalp = {
+        "pnl_pct_total": round(ms_row["pnl_pct_total"] or 0.0, 4),
+        "pnl_pct_avg": round(ms_row["pnl_pct_avg"] or 0.0, 4),
+        "closed": ms_closed,
+        "open": ms_row["open_count"] or 0,
+        "wins": ms_wins,
+        "losses": ms_losses,
+        "winrate_pct": round(ms_wins / (ms_wins + ms_losses) * 100, 2) if (ms_wins + ms_losses) else 0.0,
+    }
+
+    return {"futures": futures, "spot": spot, "micro_scalp": micro_scalp}
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────
+
+# News intelligence observacional
+
+def get_recent_symbols(limit: int = 20) -> List[str]:
+    try:
+        rows = _get_conn().execute(
+            """
+            SELECT symbol, MAX(id) AS latest_id
+            FROM market_snapshots GROUP BY symbol
+            ORDER BY latest_id DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [row["symbol"] for row in rows]
+    except Exception:
+        logger.exception("Error al obtener simbolos recientes para noticias")
+        return []
+
+
+def get_latest_symbol_price(symbol: str) -> float:
+    try:
+        row = _get_conn().execute(
+            """
+            SELECT COALESCE(NULLIF(futures_price, 0), price) AS price
+            FROM market_snapshots WHERE symbol=?
+            ORDER BY timestamp DESC, id DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        return float(row["price"] or 0.0) if row else 0.0
+    except Exception:
+        return 0.0
+
+
+def get_latest_symbol_context(symbol: str) -> Dict[str, Any]:
+    try:
+        row = _get_conn().execute(
+            """
+            SELECT timestamp, COALESCE(NULLIF(futures_price, 0), price) AS price,
+                   action, signal, score, return_5m, return_15m, return_1h,
+                   relative_volume, cvd, cvd_15m, funding, oi_change_pct
+            FROM market_snapshots WHERE symbol=?
+            ORDER BY timestamp DESC, id DESC LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        return dict(row) if row else {}
+    except Exception:
+        return {}
+
+
+def insert_news_events(events: List[Dict[str, Any]]) -> int:
+    if not events:
+        return 0
+    try:
+        conn = _get_conn()
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT INTO news_events
+                (event_id, symbol, source, source_domain, title, summary, url,
+                 published_at, collected_at, event_type, sentiment_score,
+                 weighted_score, prediction, credibility, event_types_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(event_id) DO UPDATE SET
+                source_domain=excluded.source_domain,
+                title=excluded.title,
+                summary=excluded.summary,
+                url=excluded.url,
+                published_at=excluded.published_at,
+                collected_at=excluded.collected_at,
+                event_type=excluded.event_type,
+                sentiment_score=excluded.sentiment_score,
+                weighted_score=excluded.weighted_score,
+                prediction=excluded.prediction,
+                credibility=excluded.credibility,
+                event_types_json=excluded.event_types_json
+            """,
+            [(
+                event.get("event_id", ""), event.get("symbol", ""),
+                event.get("source", ""), event.get("source_domain", ""),
+                event.get("title", ""), event.get("summary", ""),
+                event.get("url", ""), event.get("published_at", _now_iso()),
+                _now_iso(), event.get("event_type", "general"),
+                event.get("sentiment_score", 0.0), event.get("weighted_score", 0.0),
+                event.get("prediction", "NEUTRAL"), event.get("credibility", 0.0),
+                json.dumps(event.get("event_types", [])),
+            ) for event in events],
+        )
+        conn.commit()
+        return conn.total_changes - before
+    except Exception:
+        logger.exception("Error insertando news_events")
+        return 0
+
+
+def insert_news_prediction(prediction: Dict[str, Any]) -> Optional[int]:
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """
+            INSERT INTO news_predictions
+                (timestamp, symbol, prediction, sentiment_score, confidence,
+                 news_count, positive_count, negative_count, contradictory,
+                 top_events_json, price_at_prediction, horizon_minutes, outcome)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'open')
+            """,
+            (
+                prediction.get("timestamp", _now_iso()), prediction.get("symbol", ""),
+                prediction.get("prediction", "NEUTRAL"), prediction.get("sentiment_score", 0.0),
+                prediction.get("confidence", 0), prediction.get("news_count", 0),
+                prediction.get("positive_count", 0), prediction.get("negative_count", 0),
+                int(prediction.get("contradictory", False)),
+                json.dumps(prediction.get("top_events", [])),
+                prediction.get("price_at_prediction", 0.0),
+                prediction.get("horizon_minutes", 60),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        logger.exception("Error insertando news_prediction")
+        return None
+
+
+def upsert_security_event_alert(alert: Dict[str, Any]) -> Dict[str, Any]:
+    """Persiste incidente y decide si amerita notificacion nueva/escalada."""
+    try:
+        conn = _get_conn()
+        existing = conn.execute(
+            "SELECT * FROM security_event_alerts WHERE fingerprint=?",
+            (alert["fingerprint"],),
+        ).fetchone()
+        should_notify = existing is None
+        if existing:
+            should_notify = (
+                existing["confirmation_status"] != alert["confirmation_status"]
+                or float(alert["security_score"]) <= float(existing["security_score"]) - 10
+                or int(alert["source_count"]) > int(existing["source_count"])
+            )
+        now = _now_iso()
+        conn.execute(
+            """
+            INSERT INTO security_event_alerts
+                (fingerprint, created_at, updated_at, symbol, severity,
+                 confirmation_status, security_score, source_count,
+                 official_source_count, first_published_at, title, analysis_json,
+                 last_notified_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(fingerprint) DO UPDATE SET
+                updated_at=excluded.updated_at,
+                severity=excluded.severity,
+                confirmation_status=excluded.confirmation_status,
+                security_score=excluded.security_score,
+                source_count=excluded.source_count,
+                official_source_count=excluded.official_source_count,
+                first_published_at=excluded.first_published_at,
+                title=excluded.title,
+                analysis_json=excluded.analysis_json,
+                last_notified_at=CASE
+                    WHEN excluded.last_notified_at IS NOT NULL THEN excluded.last_notified_at
+                    ELSE security_event_alerts.last_notified_at
+                END
+            """,
+            (
+                alert["fingerprint"], now, now, alert["symbol"], alert["severity"],
+                alert["confirmation_status"], alert["security_score"], alert["source_count"],
+                alert["official_source_count"], alert["first_published_at"], alert["title"],
+                json.dumps(alert), now if should_notify else None,
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT id FROM security_event_alerts WHERE fingerprint=?",
+            (alert["fingerprint"],),
+        ).fetchone()
+        return {"id": row["id"] if row else None, "should_notify": should_notify}
+    except Exception:
+        logger.exception("Error persistiendo security_event_alert")
+        return {"id": None, "should_notify": False}
+
+
+def evaluate_open_news_predictions(horizon_minutes: int = 60) -> int:
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - horizon_minutes * 60)
+        rows = conn.execute(
+            "SELECT * FROM news_predictions WHERE outcome='open' AND timestamp<=? ORDER BY timestamp",
+            (cutoff,),
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            target_epoch = _iso_to_ts(row["timestamp"]) + int(row["horizon_minutes"] or horizon_minutes) * 60
+            snapshot = conn.execute(
+                """
+                SELECT COALESCE(NULLIF(futures_price, 0), price) AS price
+                FROM market_snapshots WHERE symbol=? AND timestamp>=?
+                ORDER BY timestamp ASC, id ASC LIMIT 1
+                """,
+                (row["symbol"], _ts_to_iso(target_epoch)),
+            ).fetchone()
+            start_price = float(row["price_at_prediction"] or 0.0)
+            end_price = float(snapshot["price"] or 0.0) if snapshot else 0.0
+            if start_price <= 0 or end_price <= 0:
+                continue
+            return_pct = (end_price - start_price) / start_price * 100.0
+            if row["prediction"] == "BULLISH":
+                outcome = "correct" if return_pct > 0.2 else "incorrect" if return_pct < -0.2 else "neutral"
+            elif row["prediction"] == "BEARISH":
+                outcome = "correct" if return_pct < -0.2 else "incorrect" if return_pct > 0.2 else "neutral"
+            else:
+                outcome = "neutral"
+            conn.execute(
+                """
+                UPDATE news_predictions SET evaluated_at=?, price_at_outcome=?,
+                    return_pct=?, outcome=? WHERE id=?
+                """,
+                (_now_iso(), end_price, round(return_pct, 4), outcome, row["id"]),
+            )
+            updated += 1
+        conn.commit()
+        return updated
+    except Exception:
+        logger.exception("Error evaluando news_predictions")
+        return 0
+
+
+def get_news_report(since_hours: float = 1.0) -> Dict[str, Any]:
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+        predictions = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT news_predictions.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY timestamp DESC, id DESC
+                       ) AS report_rank
+                FROM news_predictions
+                WHERE timestamp>=?
+            )
+            WHERE report_rank=1
+            ORDER BY ABS(sentiment_score) DESC, confidence DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        performance = conn.execute(
+            "SELECT outcome, COUNT(*) total FROM news_predictions WHERE evaluated_at>=? GROUP BY outcome",
+            (cutoff,),
+        ).fetchall()
+        return {
+            "predictions": [dict(row) for row in predictions],
+            "performance": {row["outcome"]: row["total"] for row in performance},
+        }
+    except Exception:
+        logger.exception("Error generando news_report")
+        return {"predictions": [], "performance": {}}
+
+
+def _iso_to_ts(value: str) -> float:
+    try:
+        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return time.time()
+
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
@@ -1224,3 +1932,77 @@ def _now_iso() -> str:
 
 def _ts_to_iso(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
+
+
+def count_recent_auto_losses(symbol: str, action: str, since_hours: float = 6.0) -> int:
+    """Cuenta cierres perdedores consecutivos recientes para un simbolo/direccion."""
+    try:
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+        rows = _get_conn().execute(
+            """SELECT total_pnl_usdt FROM auto_positions
+               WHERE symbol=? AND action=? AND status='closed' AND close_time>=?
+               ORDER BY close_time DESC LIMIT 20""",
+            (symbol, action, cutoff),
+        ).fetchall()
+        consecutive = 0
+        for row in rows:
+            if float(row["total_pnl_usdt"] or 0) < 0:
+                consecutive += 1
+            else:
+                break
+        return consecutive
+    except Exception:
+        logger.exception("Error contando perdidas consecutivas")
+        return 0
+
+
+def get_news_dashboard(since_hours: float = 24.0, event_limit: int = 40) -> Dict[str, Any]:
+    """Datos compactos para mostrar noticias y tendencia estimada en dashboard."""
+    empty = {"predictions": [], "events": [], "performance": {}}
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+        predictions = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT news_predictions.*,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY symbol ORDER BY timestamp DESC, id DESC
+                       ) AS dashboard_rank
+                FROM news_predictions
+                WHERE timestamp>=?
+            )
+            WHERE dashboard_rank=1
+            ORDER BY ABS(sentiment_score) DESC, confidence DESC
+            """,
+            (cutoff,),
+        ).fetchall()
+        events = conn.execute(
+            """
+            SELECT symbol, source, source_domain, title, summary, url,
+                   published_at, event_type, sentiment_score, weighted_score,
+                   prediction, credibility, event_types_json
+            FROM news_events
+            WHERE published_at>=?
+            ORDER BY published_at DESC, ABS(weighted_score) DESC
+            LIMIT ?
+            """,
+            (cutoff, max(1, int(event_limit))),
+        ).fetchall()
+        performance = conn.execute(
+            """
+            SELECT outcome, COUNT(*) total
+            FROM news_predictions
+            WHERE evaluated_at>=? AND outcome<>'open'
+            GROUP BY outcome
+            """,
+            (cutoff,),
+        ).fetchall()
+        return {
+            "predictions": [dict(row) for row in predictions],
+            "events": [dict(row) for row in events],
+            "performance": {row["outcome"]: row["total"] for row in performance},
+        }
+    except Exception:
+        logger.exception("Error generando datos de noticias para dashboard")
+        return empty

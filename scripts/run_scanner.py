@@ -23,7 +23,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.log_setup import setup_logging
+from app.log_setup import setup_logging, stop_logging
 
 setup_logging()
 logger = logging.getLogger("scanner")
@@ -53,6 +53,13 @@ from app.config import (
     TREND_CONTINUATION_LOOKBACK,
     MICRO_SCALP_ENABLED,
     MICRO_SCALP_ALERT_COOLDOWN_SECONDS,
+    NEWS_INTELLIGENCE_ENABLED,
+    NEWS_COLLECTION_INTERVAL_SECONDS,
+    NEWS_REPORT_INTERVAL_SECONDS,
+    NEWS_OUTCOME_HORIZON_MINUTES,
+    SECURITY_ALERTS_ENABLED,
+    SECURITY_COLLECTION_INTERVAL_SECONDS,
+    CALIBRATED_SETUP_ENABLED,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -75,14 +82,16 @@ from app.websocket_client import (
 from app.notifier import dispatch_alert, dispatch_micro_scalp_alert
 from app.outcome_tracker import run_outcome_tracker
 from app.micro_outcome_tracker import run_micro_outcome_tracker
-from app.report_sender import send_winrate_report, send_micro_scalp_report
+from app.report_sender import send_winrate_report, send_micro_scalp_report, send_news_report
+from app.news_intelligence import run_news_collection, run_security_collection, evaluate_news_predictions
 from app.auto_trader import evaluate_alert as auto_evaluate
-from app.position_monitor import check_positions, send_positions_report
+from app.position_monitor import check_positions, send_positions_report, log_pnl_overview
 from app.config import AUTO_TRADING_ENABLED, POSITION_REPORT_INTERVAL_SECONDS
 from app.exchanges.aggregator import get_multi_exchange_snapshot
 from app.ml_predictor import predictor as ml_predictor
 from app.price_action import detect_price_action_trigger
 from app.setup_rules import evaluate_trade_setup
+from app.setup_calibrator import calibrate_setup
 from app.trend_continuation import (
     is_long_momentum_continuation,
     is_short_momentum_continuation,
@@ -97,6 +106,15 @@ _MIN_SCORE_BY_ACTION: Dict[str, int] = {
     "LONG_FUTURES":  MIN_ALERT_SCORE_LONG_FUTURES,
     "SHORT_FUTURES": MIN_ALERT_SCORE_SHORT_FUTURES,
 }
+
+
+def _run_news_cycle(symbols: List[str]) -> None:
+    run_news_collection(symbols)
+    evaluate_news_predictions(NEWS_OUTCOME_HORIZON_MINUTES)
+
+
+def _run_security_cycle(symbols: List[str]) -> None:
+    run_security_collection(symbols)
 
 # cooldown state: key = "SYMBOL:ACTION", value = (last_sent_epoch, last_confidence)
 _cooldown: Dict[str, Tuple[float, int]] = {}
@@ -293,6 +311,14 @@ def _process_alert(result: Dict[str, Any]) -> None:
         "ml_filtered":  result.get("ml_filtered", False),
         "setup_route":  setup_eval_dict.get("setup_route", ""),
         "trend_priority_score": result.get("trend_priority_score", 0),
+        "original_setup_grade": (result.get("setup_calibration") or {}).get("original_grade", setup_eval_dict.get("grade", "")),
+        "calibrated_grade": (result.get("setup_calibration") or {}).get("calibrated_grade", ""),
+        "direction_score": (result.get("setup_calibration") or {}).get("direction_score", 0),
+        "entry_score": (result.get("setup_calibration") or {}).get("entry_score", 0),
+        "risk_score": (result.get("setup_calibration") or {}).get("risk_score", 0),
+        "calibration_version": (result.get("setup_calibration") or {}).get("calibration_version", ""),
+        "btc_regime": (result.get("market_regime") or {}).get("regime", "NORMAL"),
+        "watch_type": (result.get("setup_calibration") or {}).get("watch_type", ""),
     })
 
     logger.info(
@@ -504,6 +530,18 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             except Exception:
                 logger.debug("[%s] setup evaluation falló", symbol)
 
+        setup_calibration = None
+        if CALIBRATED_SETUP_ENABLED and action_cur != "WAIT":
+            setup_calibration = calibrate_setup(
+                action=action_cur,
+                setup_evaluation=setup_eval.to_dict() if setup_eval else None,
+                technical=technical,
+                metrics=metrics,
+                setup=recommendation.get("setup"),
+                market_regime=market_regime,
+            )
+            recommendation["setup_calibration"] = setup_calibration
+
         ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
         micro_scalp = {"action": "WAIT", "score": 0, "confidence": 0}
         if MICRO_SCALP_ENABLED:
@@ -519,6 +557,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
                     open_interest=oi,
                     oi_change_pct=oi_change_pct,
                     multi_ex=multi_ex,
+                    market_regime=market_regime,
                 )
                 micro_scalp["timestamp"] = ts
             except Exception:
@@ -549,6 +588,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             "market_regime":   market_regime or {},
             "trigger":         trigger,
             "setup_evaluation": setup_eval.to_dict() if setup_eval else None,
+            "setup_calibration": setup_calibration,
             # trend continuation
             "trend_priority_score":       trend_score,
             "momentum_continuation":      cont_val,
@@ -722,18 +762,28 @@ def main() -> None:
         start_liquidation_ws()
 
     _outcome_cycle = 0
+    _last_news_collection_ts = 0.0
+    _last_news_report_ts = 0.0
+    _news_executor = ThreadPoolExecutor(max_workers=1)
+    _news_future = None
+    _last_security_collection_ts = 0.0
+    _security_executor = ThreadPoolExecutor(max_workers=1)
+    _security_future = None
     _last_report_ts = 0.0          # epoch del último win rate report
     _last_micro_report_ts = 0.0    # epoch del último reporte de micro-scalping
     _last_position_report_ts = 0.0 # epoch del último reporte de posiciones
+    _last_pnl_log_ts = 0.0          # epoch del último log de PnL acumulado
 
     # Primer ciclo inmediato; luego esperar entre ciclos
     while True:
         t0 = time.monotonic()
+        results: List[Dict[str, Any]] = []
         try:
             results = run_scan_cycle(args.limit)
             logger.info("Ciclo completo: %d resultados en %.1fs", len(results), time.monotonic() - t0)
         except KeyboardInterrupt:
             logger.info("Escáner detenido por el usuario")
+            stop_logging()
             break
         except Exception:
             logger.exception("Error inesperado en ciclo de scan")
@@ -764,6 +814,15 @@ def main() -> None:
                 except Exception:
                     logger.exception("Error en send_positions_report")
 
+        # Log de PnL acumulado (futures/spot/micro-scalp) — misma cadencia que el reporte de posiciones
+        if ENABLE_DATABASE:
+            if time.time() - _last_pnl_log_ts >= POSITION_REPORT_INTERVAL_SECONDS:
+                try:
+                    log_pnl_overview()
+                    _last_pnl_log_ts = time.time()
+                except Exception:
+                    logger.exception("Error en log_pnl_overview")
+
         # Reporte de win rate periódico — basado en tiempo real, no en ciclos
         if ENABLE_DATABASE and WINRATE_REPORT_ENABLED:
             _report_interval_s = WINRATE_REPORT_INTERVAL_HOURS * 3600
@@ -793,6 +852,44 @@ def main() -> None:
                         )
                 except Exception:
                     logger.exception("Error en reporte de micro-scalp")
+
+        # Noticias por token: observacional, no modifica score ni trades.
+        if ENABLE_DATABASE and NEWS_INTELLIGENCE_ENABLED:
+            if (
+                SECURITY_ALERTS_ENABLED
+                and time.time() - _last_security_collection_ts >= SECURITY_COLLECTION_INTERVAL_SECONDS
+                and (_security_future is None or _security_future.done())
+            ):
+                try:
+                    symbols = [result["symbol"] for result in results if result.get("symbol")]
+                    _security_future = _security_executor.submit(_run_security_cycle, symbols)
+                except Exception:
+                    logger.exception("Error iniciando consulta rapida de seguridad")
+                finally:
+                    _last_security_collection_ts = time.time()
+
+            if (
+                time.time() - _last_news_collection_ts >= NEWS_COLLECTION_INTERVAL_SECONDS
+                and (_news_future is None or _news_future.done())
+            ):
+                try:
+                    symbols = [result["symbol"] for result in results if result.get("symbol")]
+                    _news_future = _news_executor.submit(_run_news_cycle, symbols)
+                except Exception:
+                    logger.exception("Error iniciando recoleccion/evaluacion de noticias")
+                finally:
+                    _last_news_collection_ts = time.time()
+
+            if (
+                time.time() - _last_news_report_ts >= NEWS_REPORT_INTERVAL_SECONDS
+                and (_news_future is None or _news_future.done())
+            ):
+                try:
+                    send_news_report(since_hours=NEWS_REPORT_INTERVAL_SECONDS / 3600.0)
+                except Exception:
+                    logger.exception("Error en reporte horario de noticias")
+                finally:
+                    _last_news_report_ts = time.time()
 
         elapsed = time.monotonic() - t0
         sleep_time = max(0.0, args.interval - elapsed)

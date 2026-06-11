@@ -51,6 +51,8 @@ def _rsi(closes: List[float], period: int = 14) -> float:
 
 def _default_context(last_price: float = 0.0) -> Dict[str, Any]:
     return {
+        "return_3m": 0.0,
+        "return_5m": 0.0,
         "return_15m": 0.0,
         "return_1h": 0.0,
         "ema_20": last_price,
@@ -101,6 +103,16 @@ def get_technical_context(symbol: str) -> Dict[str, Any]:
     vwap_distance_pct = (last_price - vwap) / vwap * 100.0 if vwap > 0.0 else 0.0
 
     # Momentum
+    return_3m = 0.0
+    if len(closes) >= 3:
+        ref = closes[-3]
+        return_3m = (last_price - ref) / ref * 100.0 if ref > 0.0 else 0.0
+
+    return_5m = 0.0
+    if len(closes) >= 5:
+        ref = closes[-5]
+        return_5m = (last_price - ref) / ref * 100.0 if ref > 0.0 else 0.0
+
     return_15m = 0.0
     if len(closes) >= 15:
         ref = closes[-15]
@@ -142,6 +154,8 @@ def get_technical_context(symbol: str) -> Dict[str, Any]:
             htf_trend_bias = "bearish"
 
     return {
+        "return_3m": round(return_3m, 4),
+        "return_5m": round(return_5m, 4),
         "return_15m": round(return_15m, 4),
         "return_1h": round(return_1h, 4),
         "ema_20": round(ema_20, 8),

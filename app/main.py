@@ -1,4 +1,5 @@
 import datetime
+import html
 import json
 import logging
 import os
@@ -66,6 +67,14 @@ def _cached_channel_stats():
 @st.cache_data(ttl=30)
 def _cached_snapshot_count():
     return database.get_snapshot_count()
+
+@st.cache_data(ttl=60)
+def _cached_news_dashboard(since_hours: float = 24.0, event_limit: int = 40):
+    return database.get_news_dashboard(since_hours=since_hours, event_limit=event_limit)
+
+@st.cache_data(ttl=30)
+def _cached_pnl_overview():
+    return database.get_pnl_overview()
 
 
 def _build_rows_from_db(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -175,6 +184,10 @@ st.markdown(
     .alert-high   { background-color: #7f1d1d; border-left: 4px solid #ef4444; padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; }
     .alert-medium { background-color: #78350f; border-left: 4px solid #f59e0b; padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; }
     .alert-low    { background-color: #14532d; border-left: 4px solid #22c55e; padding: 8px 12px; border-radius: 6px; margin-bottom: 6px; }
+    .news-card { background-color:#111827; border:1px solid #253044; border-radius:6px; padding:12px; margin-bottom:8px; }
+    .news-bullish { border-left:4px solid #22c55e; }
+    .news-bearish { border-left:4px solid #ef4444; }
+    .news-neutral { border-left:4px solid #9ca3af; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -288,8 +301,111 @@ st.caption(
     f"Antigüedad máx: {_max_age}s · TTL caché: 15s"
 )
 
+# ── PnL actual ────────────────────────────────────────────────────────────
+st.markdown("### 💰 PnL acumulado")
+_pnl = _cached_pnl_overview() if ENABLE_DATABASE else {"futures": {}, "spot": {}, "micro_scalp": {}}
+_pf, _ps, _pm = _pnl.get("futures", {}), _pnl.get("spot", {}), _pnl.get("micro_scalp", {})
+
+pnl_c1, pnl_c2, pnl_c3 = st.columns(3)
+pnl_c1.metric(
+    "📈 Futures (USDT)",
+    f"{_pf.get('pnl_usdt', 0.0):+.2f}$",
+    f"WR {_pf.get('winrate_pct', 0.0):.1f}% · {_pf.get('closed', 0)} cerradas / {_pf.get('open', 0)} abiertas",
+    delta_color="off",
+)
+pnl_c2.metric(
+    "🪙 Spot (USDT)",
+    f"{_ps.get('pnl_usdt', 0.0):+.2f}$",
+    f"WR {_ps.get('winrate_pct', 0.0):.1f}% · {_ps.get('closed', 0)} cerradas / {_ps.get('open', 0)} abiertas",
+    delta_color="off",
+)
+pnl_c3.metric(
+    "⚡ Micro-scalping (%)",
+    f"{_pm.get('pnl_pct_total', 0.0):+.2f}%",
+    f"WR {_pm.get('winrate_pct', 0.0):.1f}% · {_pm.get('closed', 0)} cerradas / {_pm.get('open', 0)} abiertas",
+    delta_color="off",
+)
+st.caption("PnL realizado acumulado (histórico, paper) · Futures/Spot en USDT · Micro-scalp en % acumulado")
+
 
 # ── Sección 1: Oportunidades accionables ─────────────────────────────────
+
+# Noticias recientes y tendencia estimada. Es observacional: no abre posiciones.
+st.markdown("### Noticias recientes y tendencia estimada")
+news_data = _cached_news_dashboard(since_hours=24.0, event_limit=40) if ENABLE_DATABASE else {
+    "predictions": [], "events": [], "performance": {}
+}
+news_predictions = news_data.get("predictions", [])
+news_events = news_data.get("events", [])
+
+if not news_predictions and not news_events:
+    st.info("Aun no hay noticias clasificadas en las ultimas 24 horas.")
+else:
+    pred_by_symbol = {row.get("symbol", ""): row for row in news_predictions}
+    bullish_count = sum(1 for row in news_predictions if row.get("prediction") == "BULLISH")
+    bearish_count = sum(1 for row in news_predictions if row.get("prediction") == "BEARISH")
+    neutral_count = sum(1 for row in news_predictions if row.get("prediction") == "NEUTRAL")
+    nc1, nc2, nc3, nc4 = st.columns(4)
+    nc1.metric("Tokens con noticias", len(pred_by_symbol))
+    nc2.metric("Estimado bullish", bullish_count)
+    nc3.metric("Estimado bearish", bearish_count)
+    nc4.metric("Neutral / mixto", neutral_count)
+
+    for prediction in news_predictions[:8]:
+        symbol = prediction.get("symbol", "")
+        tendency = prediction.get("prediction", "NEUTRAL")
+        confidence = int(prediction.get("confidence", 0) or 0)
+        score = float(prediction.get("sentiment_score", 0) or 0)
+        contradictory = bool(prediction.get("contradictory", False))
+        css = {"BULLISH": "news-bullish", "BEARISH": "news-bearish"}.get(tendency, "news-neutral")
+        if tendency == "BULLISH" and confidence >= 65 and not contradictory:
+            recommendation = "ALERTA ALCISTA: buscar confirmacion tecnica antes de una entrada long."
+        elif tendency == "BEARISH" and confidence >= 65 and not contradictory:
+            recommendation = "ALERTA BAJISTA: vigilar short o reducir exposicion long."
+        elif contradictory:
+            recommendation = "NOTICIAS CONTRADICTORIAS: esperar confirmacion; evitar entrada por noticia."
+        else:
+            recommendation = "OBSERVAR: evidencia informativa insuficiente para operar."
+
+        token_events = [event for event in news_events if event.get("symbol") == symbol][:3]
+        event_html = ""
+        for event in token_events:
+            title = html.escape(str(event.get("title", "")))
+            source = html.escape(str(event.get("source_domain") or event.get("source") or "fuente"))
+            url = html.escape(str(event.get("url", "")), quote=True)
+            when = html.escape(_utc_to_local(event.get("published_at", ""), fmt="%d/%m %H:%M"))
+            link = f"<a href='{url}' target='_blank' style='color:#93c5fd'>{title}</a>" if url else title
+            event_html += f"<li>{link}<br><span style='color:#6b7280;font-size:11px'>{source} | {when}</span></li>"
+
+        st.markdown(
+            f"<div class='news-card {css}'>"
+            f"<div style='display:flex;justify-content:space-between;gap:12px'>"
+            f"<b style='font-size:16px;color:#f9fafb'>{html.escape(symbol)}</b>"
+            f"<b>{html.escape(tendency)} | confianza {confidence}%</b></div>"
+            f"<div style='font-size:12px;color:#9ca3af;margin:4px 0'>"
+            f"Score noticias: {score:+.1f} | positivas: {prediction.get('positive_count', 0)} | "
+            f"negativas: {prediction.get('negative_count', 0)} | total: {prediction.get('news_count', 0)}</div>"
+            f"<div style='font-size:12px;color:#e5e7eb'><b>Recomendacion:</b> {html.escape(recommendation)}</div>"
+            f"<ul style='font-size:12px;color:#d1d5db;margin:7px 0 0;padding-left:18px'>{event_html}</ul>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Ver listado completo de noticias de las ultimas 24 horas"):
+        event_rows = [{
+            "Hora": _utc_to_local(event.get("published_at", ""), fmt="%d/%m %H:%M"),
+            "Token": event.get("symbol", ""),
+            "Estimado": event.get("prediction", "NEUTRAL"),
+            "Score": round(float(event.get("weighted_score", 0) or 0), 1),
+            "Credibilidad %": round(float(event.get("credibility", 0) or 0) * 100, 0),
+            "Fuente": event.get("source_domain") or event.get("source", ""),
+            "Titular": event.get("title", ""),
+            "Resumen": event.get("summary", ""),
+            "URL": event.get("url", ""),
+        } for event in news_events]
+        st.dataframe(pd.DataFrame(event_rows), use_container_width=True, hide_index=True)
+
+# Oportunidades accionables
 st.markdown("### 🎯 Oportunidades de trading")
 
 actionable = sorted(
