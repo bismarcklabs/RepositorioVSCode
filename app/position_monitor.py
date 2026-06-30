@@ -17,6 +17,7 @@ from app import database, market_data
 from app.auto_trader import calc_pnl, _DIRECTION
 from app.config import (
     AUTO_TRADING_ENABLED,
+    AUTO_TRADING_EXCHANGE,
     AUTO_TRADING_MODE,
     AUTO_TRADING_CAPITAL_USDT,
     AUTO_TRADING_MAX_POSITIONS,
@@ -110,6 +111,39 @@ def _post_telegram(message: str) -> None:
         pass
 
 
+# ── KuCoin real-position closer ────────────────────────────────────────────
+
+def _close_kucoin_position(pos: Dict, price: float) -> None:
+    """Envía orden de cierre a KuCoin para posiciones reales. No bloquea el monitor."""
+    if pos.get("exchange") != "kucoin":
+        return
+    try:
+        from app.exchanges import kucoin_trader
+        from app.exchanges.symbol_map import get_kucoin_spot_symbol, get_normalized
+        action     = pos["action"]
+        normalized = get_normalized(pos["symbol"]) or pos["symbol"].replace("USDT", "")
+        kc_spot    = get_kucoin_spot_symbol(normalized) or f"{normalized}-USDT"
+        base_qty   = pos["size_usdt"] / pos["entry_price"] if pos["entry_price"] > 0 else None
+        result = kucoin_trader.close_order(
+            action, normalized, kc_spot,
+            pos["size_usdt"], price,
+            leverage=pos.get("leverage") or 1,
+            base_qty=base_qty,
+        )
+        if result.ok:
+            logger.info(
+                "KUCOIN CLOSE OK %s %s | order_id=%s",
+                action, pos["symbol"], result.order_id,
+            )
+        else:
+            logger.error(
+                "KUCOIN CLOSE FAILED %s %s: %s",
+                action, pos["symbol"], result.error,
+            )
+    except Exception:
+        logger.exception("Error cerrando posicion en KuCoin %s", pos.get("symbol"))
+
+
 # ── TP/SL checker ─────────────────────────────────────────────────────────
 
 def check_positions() -> None:
@@ -150,6 +184,7 @@ def check_positions() -> None:
             # precio observado convierte un gap del monitor en una perdida ficticia.
             exit_price = sl if AUTO_TRADING_MODE == "paper" else price
             exit_pnl = calc_pnl(pos, exit_price)
+            _close_kucoin_position(pos, exit_price)
             database.close_auto_position(
                 pos["id"], exit_price, reason,
                 exit_pnl["open_pnl_usdt"], exit_pnl["total_pnl_usdt"], exit_pnl["total_pnl_pct"],
@@ -166,6 +201,7 @@ def check_positions() -> None:
             max_move = abs(AUTO_TRADING_PAPER_MAX_LOSS_PCT) / (100.0 * leverage)
             cap_price = entry * (1.0 - direction * max_move)
             cap_pnl = calc_pnl(pos, cap_price)
+            _close_kucoin_position(pos, cap_price)
             database.close_auto_position(
                 pos["id"], cap_price, "paper_hard_cap",
                 cap_pnl["open_pnl_usdt"], cap_pnl["total_pnl_usdt"], cap_pnl["total_pnl_pct"],
@@ -180,6 +216,7 @@ def check_positions() -> None:
             and elapsed_hours >= AUTO_TRADING_RISK_CUT_MIN_HOURS
             and pnl["total_pnl_pct"] <= -abs(AUTO_TRADING_RISK_CUT_LOSS_PCT)
         ):
+            _close_kucoin_position(pos, price)
             database.close_auto_position(
                 pos["id"], price, "risk_cut",
                 pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
@@ -194,6 +231,7 @@ def check_positions() -> None:
         if tp1_hit and tp2:
             tp2_hit = (direction == 1 and price >= tp2) or (direction == -1 and price <= tp2)
             if tp2_hit:
+                _close_kucoin_position(pos, price)
                 database.close_auto_position(
                     pos["id"], price, "tp2",
                     pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
@@ -220,6 +258,7 @@ def check_positions() -> None:
                     # Recalcular pnl con la posición ya actualizada como tp1_hit
                     pos_updated = {**pos, "tp1_hit": 1, "tp1_pnl_usdt": tp1_pnl_usdt, "sl_current": entry}
                     pnl2 = calc_pnl(pos_updated, price)
+                    _close_kucoin_position(pos, price)
                     database.close_auto_position(
                         pos["id"], price, "tp1_only",
                         pnl2["open_pnl_usdt"], tp1_pnl_usdt, round(tp1_pnl_usdt / size * 100, 2),
@@ -227,6 +266,7 @@ def check_positions() -> None:
                     logger.info("AUTO TP1_ONLY %s %s | sin TP2 → cerrado", action, sym)
 
         if elapsed_hours >= AUTO_TRADING_TIMEOUT_HOURS:
+            _close_kucoin_position(pos, price)
             database.close_auto_position(
                 pos["id"], price, "timeout",
                 pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
@@ -362,6 +402,225 @@ def send_positions_report() -> None:
         logger.info("[auto-trading] Reporte de posiciones enviado")
     except Exception as exc:
         logger.warning("[auto-trading] Error en reporte de posiciones: %s", exc)
+
+
+def recover_gap_positions() -> None:
+    """Replay de klines históricos para cerrar posiciones que tocaron TP/SL/timeout
+    mientras el scanner estuvo offline.
+
+    Ejecutar una vez al inicio del scanner, antes del primer ciclo.
+    Usa velas de 15m del endpoint de Binance con startTime/endTime explícitos,
+    por lo que funciona aunque el histórico no esté en la caché local.
+    """
+    if not AUTO_TRADING_ENABLED:
+        return
+
+    positions = database.get_open_auto_positions()
+    if not positions:
+        return
+
+    now_ts = time.time()
+    recovered = 0
+
+    for pos in positions:
+        sym       = pos["symbol"]
+        action    = pos["action"]
+        direction = _DIRECTION.get(action, 1)
+        entry     = pos["entry_price"]
+        size      = pos["size_usdt"]
+        leverage  = pos.get("leverage") or 1
+        tp1       = pos.get("tp1")
+        tp2       = pos.get("tp2")
+        sl_orig   = pos.get("sl_current") or pos.get("sl")
+        tp1_hit_db   = bool(pos.get("tp1_hit"))
+        tp1_pnl_db   = pos.get("tp1_pnl_usdt") or 0.0
+
+        try:
+            open_dt = datetime.datetime.fromisoformat(pos["open_time"])
+            if open_dt.tzinfo is None:
+                open_dt = open_dt.replace(tzinfo=datetime.timezone.utc)
+            open_ts = open_dt.timestamp()
+        except Exception:
+            logger.warning("GAP RECOVERY: open_time inválido en pos %d", pos["id"])
+            continue
+
+        elapsed_h = (now_ts - open_ts) / 3600
+
+        # Posiciones muy recientes: el ciclo normal las manejará
+        if elapsed_h < 0.25:
+            continue
+
+        # Rango de klines: desde apertura hasta timeout+15min de margen
+        end_ts   = min(now_ts, open_ts + AUTO_TRADING_TIMEOUT_HOURS * 3600 + 900)
+        start_ms = int(open_ts * 1000)
+        end_ms   = int(end_ts * 1000)
+
+        try:
+            klines = market_data.get_klines(sym, interval="15m", limit=500,
+                                            start_time_ms=start_ms, end_time_ms=end_ms)
+        except Exception:
+            klines = []
+
+        if not klines:
+            # Sin klines: aplicar timeout si el tiempo ya expiró
+            if elapsed_h >= AUTO_TRADING_TIMEOUT_HOURS:
+                try:
+                    price = (market_data.get_futures_price(sym) if "FUTURES" in action
+                             else market_data.get_spot_price(sym))
+                    if price:
+                        pnl = calc_pnl(pos, price)
+                        database.close_auto_position(
+                            pos["id"], price, "timeout",
+                            pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+                        )
+                        _notify_close(pos, price, "timeout", pnl)
+                        recovered += 1
+                        logger.info("GAP RECOVERY TIMEOUT %s %s | sin klines | exit=%.6g",
+                                    action, sym, price)
+                except Exception:
+                    logger.warning("GAP RECOVERY: error cerrando timeout para %s", sym)
+            continue
+
+        # Estado local que evoluciona con el replay (sin tocar DB hasta cierre definitivo)
+        sl_cur       = sl_orig
+        tp1_hit      = tp1_hit_db
+        tp1_pnl_acc  = tp1_pnl_db
+        pos_state    = dict(pos)
+        closed       = False
+
+        for k in klines:
+            c_ts      = int(k[0]) / 1000.0
+            c_high    = float(k[2])
+            c_low     = float(k[3])
+            c_close   = float(k[4])
+            c_elapsed = (c_ts - open_ts) / 3600
+
+            pos_state["sl_current"]   = sl_cur
+            pos_state["tp1_hit"]      = int(tp1_hit)
+            pos_state["tp1_pnl_usdt"] = tp1_pnl_acc
+
+            # ── Paper hard cap ──────────────────────────────────────────────
+            if AUTO_TRADING_MODE == "paper":
+                pnl_chk = calc_pnl(pos_state, c_close)
+                if pnl_chk["total_pnl_pct"] <= -abs(AUTO_TRADING_PAPER_MAX_LOSS_PCT):
+                    max_move  = abs(AUTO_TRADING_PAPER_MAX_LOSS_PCT) / (100.0 * leverage)
+                    cap_price = entry * (1.0 - direction * max_move)
+                    cap_pnl   = calc_pnl(pos_state, cap_price)
+                    database.close_auto_position(
+                        pos["id"], cap_price, "paper_hard_cap",
+                        cap_pnl["open_pnl_usdt"], cap_pnl["total_pnl_usdt"], cap_pnl["total_pnl_pct"],
+                    )
+                    _notify_close(pos, cap_price, "paper_hard_cap", cap_pnl)
+                    closed = True
+                    logger.warning("GAP RECOVERY HARD CAP %s %s | P&L %.2f%%",
+                                   action, sym, cap_pnl["total_pnl_pct"])
+                    break
+
+            # ── TP2 (solo si TP1 ya fue alcanzado) ─────────────────────────
+            if tp1_hit and tp2:
+                tp2_hit = (direction == 1 and c_high >= tp2) or (direction == -1 and c_low <= tp2)
+                if tp2_hit:
+                    pnl = calc_pnl(pos_state, tp2)
+                    database.close_auto_position(
+                        pos["id"], tp2, "tp2",
+                        pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+                    )
+                    _notify_close(pos, tp2, "tp2", pnl)
+                    closed = True
+                    logger.info("GAP RECOVERY TP2 %s %s | exit=%.6g | P&L $%.2f",
+                                action, sym, tp2, pnl["total_pnl_usdt"])
+                    break
+
+            # ── Detectar hits de SL y TP1 en esta vela ─────────────────────
+            sl_hit = (direction == 1 and c_low <= sl_cur) or (direction == -1 and c_high >= sl_cur)
+
+            tp1_reached = False
+            if not tp1_hit and tp1:
+                tp1_reached = ((direction == 1 and c_high >= tp1) or
+                               (direction == -1 and c_low <= tp1))
+
+            # Si ambos en la misma vela: TP1 tiene prioridad (conservador)
+            if tp1_reached and sl_hit:
+                sl_hit = False
+
+            # ── SL ──────────────────────────────────────────────────────────
+            if sl_hit:
+                exit_price = sl_cur if AUTO_TRADING_MODE == "paper" else c_close
+                reason     = "sl_breakeven" if tp1_hit else "sl"
+                pnl        = calc_pnl(pos_state, exit_price)
+                database.close_auto_position(
+                    pos["id"], exit_price, reason,
+                    pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+                )
+                _notify_close(pos, exit_price, reason, pnl)
+                closed = True
+                logger.info("GAP RECOVERY SL%s %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
+                            "(BE)" if tp1_hit else "", action, sym,
+                            exit_price, pnl["total_pnl_usdt"], pnl["total_pnl_pct"])
+                break
+
+            # ── TP1 ─────────────────────────────────────────────────────────
+            if tp1_reached:
+                half_pnl_pct = direction * (tp1 - entry) / entry * leverage * 100
+                tp1_pnl_usdt = round(size * 0.5 * half_pnl_pct / 100, 4)
+                database.update_auto_position_tp1(pos["id"], tp1_pnl_usdt, entry)
+                tp1_hit      = True
+                tp1_pnl_acc  = tp1_pnl_usdt
+                sl_cur       = entry  # mover SL a breakeven
+                pos_state["sl_current"]   = sl_cur
+                pos_state["tp1_hit"]      = 1
+                pos_state["tp1_pnl_usdt"] = tp1_pnl_acc
+                _notify_tp1(pos, tp1, tp1_pnl_usdt)
+                logger.info("GAP RECOVERY TP1 %s %s | tp1=%.6g | parcial=$%.2f | SL→BE",
+                            action, sym, tp1, tp1_pnl_usdt)
+
+                if not tp2:
+                    pnl = calc_pnl(pos_state, tp1)
+                    database.close_auto_position(
+                        pos["id"], tp1, "tp1_only",
+                        pnl["open_pnl_usdt"], tp1_pnl_usdt, round(tp1_pnl_usdt / size * 100, 2),
+                    )
+                    _notify_close(pos, tp1, "tp1_only", pnl)
+                    closed = True
+                    logger.info("GAP RECOVERY TP1_ONLY %s %s | sin TP2 → cerrado", action, sym)
+                    break
+                continue
+
+            # ── Risk cut (pérdida fuerte antes del timeout) ─────────────────
+            if (AUTO_TRADING_RISK_CUT_ENABLED and not tp1_hit
+                    and c_elapsed >= AUTO_TRADING_RISK_CUT_MIN_HOURS):
+                pnl_chk = calc_pnl(pos_state, c_close)
+                if pnl_chk["total_pnl_pct"] <= -abs(AUTO_TRADING_RISK_CUT_LOSS_PCT):
+                    database.close_auto_position(
+                        pos["id"], c_close, "risk_cut",
+                        pnl_chk["open_pnl_usdt"], pnl_chk["total_pnl_usdt"], pnl_chk["total_pnl_pct"],
+                    )
+                    _notify_close(pos, c_close, "risk_cut", pnl_chk)
+                    closed = True
+                    logger.info("GAP RECOVERY RISK_CUT %s %s | exit=%.6g | P&L $%.2f",
+                                action, sym, c_close, pnl_chk["total_pnl_usdt"])
+                    break
+
+            # ── Timeout ─────────────────────────────────────────────────────
+            if c_elapsed >= AUTO_TRADING_TIMEOUT_HOURS:
+                pnl = calc_pnl(pos_state, c_close)
+                database.close_auto_position(
+                    pos["id"], c_close, "timeout",
+                    pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
+                )
+                _notify_close(pos, c_close, "timeout", pnl)
+                closed = True
+                logger.info("GAP RECOVERY TIMEOUT %s %s | exit=%.6g | P&L $%.2f (%.2f%%)",
+                            action, sym, c_close, pnl["total_pnl_usdt"], pnl["total_pnl_pct"])
+                break
+
+        if closed:
+            recovered += 1
+
+    if recovered:
+        logger.info("GAP RECOVERY: %d posicion(es) resueltas durante el downtime", recovered)
+    else:
+        logger.info("GAP RECOVERY: todas las posiciones abiertas son recientes, sin gaps")
 
 
 def log_pnl_overview() -> None:

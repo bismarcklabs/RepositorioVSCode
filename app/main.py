@@ -670,12 +670,17 @@ if display_rows:
 
     with col_d:
         st.markdown("**CVD 1h / 15m** — flujo acumulado y aceleración reciente.")
+        # Pre-melt para compatibilidad con pandas 3.0 + plotly express
+        _df_cvd = (
+            df_c.sort_values("cvd", ascending=False)[["symbol", "cvd", "cvd_15m"]]
+            .melt(id_vars="symbol", value_vars=["cvd", "cvd_15m"],
+                  var_name="Ventana", value_name="CVD")
+        )
         fig = px.bar(
-            df_c.sort_values("cvd", ascending=False),
-            x="symbol", y=["cvd", "cvd_15m"],
-            title="CVD 1h vs CVD 15m", barmode="group",
+            _df_cvd, x="symbol", y="CVD",
+            color="Ventana", barmode="group",
+            title="CVD 1h vs CVD 15m",
             color_discrete_map={"cvd": "#6b7280", "cvd_15m": "#10b981"},
-            labels={"value": "CVD", "variable": "Ventana"},
         )
         st.plotly_chart(fig, use_container_width=True)
 

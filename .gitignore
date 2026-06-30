@@ -27,3 +27,6 @@ build/
 
 # Configuracion local de Claude Code (permisos especificos de la maquina)
 .claude/settings.local.json
+
+# Archivos con credenciales sueltas (no deben subirse al repo)
+scripts/google oauth para inicio de sesión.txt

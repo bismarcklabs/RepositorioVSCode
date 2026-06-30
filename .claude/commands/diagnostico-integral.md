@@ -1,8 +1,12 @@
-Ejecuta una evaluación completa del rendimiento del sistema de alertas, incluyendo calibración de grados, posiciones paper, micro-scalping y correlación con el módulo de noticias.
+Ejecuta un diagnóstico integral del sistema, combinando en un solo informe lo que cubren por separado `valorar-sistema` (rendimiento del scanner, calibración, paper trading, micro-scalping y noticias) y `consulta-mercado-internacional` (actividad por sesión horaria UTC), sin duplicar configuración, consultas ni conclusiones.
 
-Usa `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')` al inicio del script para evitar errores de encoding en Windows.
+El análisis debe ejecutarse como **un único** script Python temporal que:
+- Use `sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')` al inicio para evitar errores de encoding en Windows.
+- Conecte a la base de datos mediante `from app import database; conn = database._get_conn()` (o `app/config.DATABASE_PATH` si se necesita acceso crudo).
+- Reutilice los mismos DataFrames/consultas base (p. ej. `trade_alerts` + `alert_outcomes` a 60m, `micro_scalp_alerts`) entre las secciones que los necesiten, en vez de re-consultarlos.
+- Se elimine al finalizar.
 
-El análisis debe ejecutarse como un script Python temporal que conecte a la base de datos mediante `from app import database; conn = database._get_conn()`. Al finalizar, elimina el script.
+Presenta todos los resultados en tablas markdown. Usa ⚠️ para advertencias y ✅ para confirmaciones positivas.
 
 ---
 
@@ -123,14 +127,38 @@ Si hay 0 registros, indicarlo brevemente.
 
 ---
 
-## 7. Resumen ejecutivo
+## 7. Actividad de mercado por sesión horaria UTC
 
-Al final, presenta un bloque de conclusiones con:
+Reutiliza el dataset de alertas evaluadas a 60m de la sección 2 y el de `micro_scalp_alerts` de la sección 5 — no vuelvas a consultarlos desde cero, solo agrúpalos también por `strftime('%H', timestamp)`.
+
+### 7a. Win rate y retorno promedio por hora UTC (alertas normales, horizon 60m, outcomes win/partial/loss)
+
+### 7b. Win rate y PnL promedio por hora UTC (micro-scalping)
+
+### 7c. Resumen por bloque de sesión institucional
+
+- Asia profunda (00-07 UTC) — Tokio/Shanghái
+- Overlap Asia-Europa (07-09 UTC) — cierre Asia + apertura Europa
+- Europa sola (09-13 UTC) — Frankfurt/Londres sin NY
+- Overlap Europa-US (13-17 UTC) — apertura Wall Street
+- US sola (17-22 UTC) — sesión americana
+- Dead zone (22-00 UTC) — madrugada global
+
+### 7d. Retorno por hora desglosado entre LONG_FUTURES y SHORT_FUTURES
+
+### 7e. Top símbolos por sesión (min 3 alertas, ordenados por avg retorno)
+
+---
+
+## 8. Resumen ejecutivo
+
+Presenta un único bloque de conclusiones combinando ambos análisis:
+
 - **¿Subió el WR tras los cambios recientes?** (comparar pre vs post con números concretos)
 - **¿El grado calibrado A/B discrimina mejor que C/NO_TRADE?** (sí/no + dato)
 - **¿El SL fix redujo las pérdidas ficticias en paper?** (sí/no + cuánto)
 - **¿El micro-scalping tiene asimetría R:R negativa?** (advertencia si WR>50% pero PnL<0)
 - **¿Las noticias predicen algo útil?** (accuracy BULLISH/BEARISH + ¿hay diferencia de WR entre alineadas y contrarias?)
+- **¿Qué hora UTC tiene el mayor WR y retorno, y qué bloque es mejor/peor para micro-scalp?** (incluir equivalencia en hora México, UTC-6)
+- **Comportamiento en la apertura de Wall Street (13:30-15:30 UTC)**
 - **Próximos pasos sugeridos** (máximo 3 puntos concisos)
-
-Presenta todos los resultados en tablas markdown. Usa ⚠️ para advertencias y ✅ para confirmaciones positivas.

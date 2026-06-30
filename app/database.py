@@ -121,6 +121,9 @@ def _migrate_schema() -> None:
         ("micro_scalp_alerts", "pnl_pct",          "REAL DEFAULT 0"),
         ("micro_scalp_alerts", "max_favorable_pct","REAL DEFAULT 0"),
         ("micro_scalp_alerts", "max_adverse_pct",  "REAL DEFAULT 0"),
+        # exchange tracking en auto_positions (real trading)
+        ("auto_positions", "exchange",          "TEXT NOT NULL DEFAULT 'paper'"),
+        ("auto_positions", "exchange_order_id", "TEXT"),
     ]
     for table, col, col_def in new_columns:
         try:
@@ -265,28 +268,30 @@ def init_db() -> None:
                     ON alert_outcomes(alert_id);
 
                 CREATE TABLE IF NOT EXISTS auto_positions (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    alert_id        INTEGER REFERENCES trade_alerts(id),
-                    symbol          TEXT    NOT NULL,
-                    action          TEXT    NOT NULL,
-                    mode            TEXT    NOT NULL DEFAULT 'paper',
-                    open_time       TEXT    NOT NULL,
-                    close_time      TEXT,
-                    entry_price     REAL    NOT NULL,
-                    size_usdt       REAL    NOT NULL,
-                    leverage        INTEGER NOT NULL DEFAULT 1,
-                    tp1             REAL,
-                    tp2             REAL,
-                    sl              REAL    NOT NULL,
-                    sl_current      REAL    NOT NULL,
-                    status          TEXT    NOT NULL DEFAULT 'open',
-                    tp1_hit         INTEGER NOT NULL DEFAULT 0,
-                    tp1_pnl_usdt    REAL    NOT NULL DEFAULT 0.0,
-                    close_reason    TEXT,
-                    exit_price      REAL,
-                    final_pnl_usdt  REAL,
-                    total_pnl_usdt  REAL,
-                    total_pnl_pct   REAL
+                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                    alert_id          INTEGER REFERENCES trade_alerts(id),
+                    symbol            TEXT    NOT NULL,
+                    action            TEXT    NOT NULL,
+                    mode              TEXT    NOT NULL DEFAULT 'paper',
+                    exchange          TEXT    NOT NULL DEFAULT 'paper',
+                    exchange_order_id TEXT,
+                    open_time         TEXT    NOT NULL,
+                    close_time        TEXT,
+                    entry_price       REAL    NOT NULL,
+                    size_usdt         REAL    NOT NULL,
+                    leverage          INTEGER NOT NULL DEFAULT 1,
+                    tp1               REAL,
+                    tp2               REAL,
+                    sl                REAL    NOT NULL,
+                    sl_current        REAL    NOT NULL,
+                    status            TEXT    NOT NULL DEFAULT 'open',
+                    tp1_hit           INTEGER NOT NULL DEFAULT 0,
+                    tp1_pnl_usdt      REAL    NOT NULL DEFAULT 0.0,
+                    close_reason      TEXT,
+                    exit_price        REAL,
+                    final_pnl_usdt    REAL,
+                    total_pnl_usdt    REAL,
+                    total_pnl_pct     REAL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_autopos_status
@@ -448,6 +453,44 @@ def init_db() -> None:
                 );
                 CREATE INDEX IF NOT EXISTS idx_security_alerts_sym_ts
                     ON security_event_alerts(symbol, created_at);
+
+                -- Accumulation Watch: tokens fuera del top-50 por volumen en fase
+                -- de "coiling" (contracción de volatilidad + acumulación), candidatos
+                -- a "ignición" (breakout tipo FOMO).
+                CREATE TABLE IF NOT EXISTS accumulation_watch (
+                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol              TEXT    NOT NULL UNIQUE,
+                    first_seen          TEXT    NOT NULL,
+                    last_scan           TEXT    NOT NULL,
+                    coiling_score       REAL    DEFAULT 0,
+                    contraction_ratio   REAL    DEFAULT 0,
+                    position_in_range   REAL    DEFAULT 0,
+                    above_sma50         INTEGER DEFAULT 0,
+                    vol_ratio_7_30      REAL    DEFAULT 0,
+                    quote_volume        REAL    DEFAULT 0,
+                    funding_at_watch    REAL    DEFAULT 0,
+                    price_at_watch      REAL    DEFAULT 0,
+                    status              TEXT    DEFAULT 'watching',
+                    ignited_at          TEXT,
+                    ignition_reason     TEXT    DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_accum_watch_status
+                    ON accumulation_watch(status);
+                CREATE INDEX IF NOT EXISTS idx_accum_watch_score
+                    ON accumulation_watch(coiling_score);
+                CREATE TABLE IF NOT EXISTS historical_klines (
+                    symbol     TEXT    NOT NULL,
+                    interval   TEXT    NOT NULL,
+                    open_time  INTEGER NOT NULL,
+                    open       REAL    NOT NULL,
+                    high       REAL    NOT NULL,
+                    low        REAL    NOT NULL,
+                    close      REAL    NOT NULL,
+                    volume     REAL    NOT NULL,
+                    PRIMARY KEY (symbol, interval, open_time)
+                );
+                CREATE INDEX IF NOT EXISTS idx_hk_symbol_interval
+                    ON historical_klines(symbol, interval);
             """)
             conn.commit()
             _migrate_schema()
@@ -1516,16 +1559,29 @@ def insert_auto_position(data: Dict[str, Any]) -> int:
     cur = conn.execute(
         """
         INSERT INTO auto_positions
-            (alert_id, symbol, action, mode, open_time, entry_price, size_usdt,
-             leverage, tp1, tp2, sl, sl_current)
+            (alert_id, symbol, action, mode, exchange, exchange_order_id,
+             open_time, entry_price, size_usdt, leverage, tp1, tp2, sl, sl_current)
         VALUES
-            (:alert_id, :symbol, :action, :mode, :open_time, :entry_price, :size_usdt,
-             :leverage, :tp1, :tp2, :sl, :sl_current)
+            (:alert_id, :symbol, :action, :mode, :exchange, :exchange_order_id,
+             :open_time, :entry_price, :size_usdt, :leverage, :tp1, :tp2, :sl, :sl_current)
         """,
-        data,
+        {
+            "exchange":          data.get("exchange", "paper"),
+            "exchange_order_id": data.get("exchange_order_id"),
+            **data,
+        },
     )
     conn.commit()
     return cur.lastrowid
+
+
+def update_auto_position_exchange_order(position_id: int, exchange: str, order_id: str) -> None:
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE auto_positions SET exchange=?, exchange_order_id=? WHERE id=?",
+        (exchange, order_id, position_id),
+    )
+    conn.commit()
 
 
 def get_open_auto_positions() -> List[Dict[str, Any]]:
@@ -2006,3 +2062,144 @@ def get_news_dashboard(since_hours: float = 24.0, event_limit: int = 40) -> Dict
     except Exception:
         logger.exception("Error generando datos de noticias para dashboard")
         return empty
+
+
+# ── Accumulation Watch ─────────────────────────────────────────────────────
+
+def upsert_accumulation_watch(data: Dict[str, Any]) -> None:
+    """Inserta o actualiza el estado de coiling de un símbolo.
+
+    En conflicto (símbolo ya existe), conserva `first_seen`, `funding_at_watch`
+    y `price_at_watch` originales (línea base de la "vigilancia"), y solo
+    refresca las métricas de coiling y `last_scan`. El status vuelve a
+    'watching' salvo que ya esté 'ignited'.
+    """
+    try:
+        conn = _get_conn()
+        now = _now_iso()
+        conn.execute(
+            """
+            INSERT INTO accumulation_watch (
+                symbol, first_seen, last_scan, coiling_score, contraction_ratio,
+                position_in_range, above_sma50, vol_ratio_7_30, quote_volume,
+                funding_at_watch, price_at_watch, status
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'watching')
+            ON CONFLICT(symbol) DO UPDATE SET
+                last_scan = excluded.last_scan,
+                coiling_score = excluded.coiling_score,
+                contraction_ratio = excluded.contraction_ratio,
+                position_in_range = excluded.position_in_range,
+                above_sma50 = excluded.above_sma50,
+                vol_ratio_7_30 = excluded.vol_ratio_7_30,
+                quote_volume = excluded.quote_volume,
+                status = CASE
+                    WHEN accumulation_watch.status = 'ignited' THEN accumulation_watch.status
+                    ELSE 'watching'
+                END
+            """,
+            (
+                data["symbol"], now, now,
+                data.get("coiling_score", 0.0),
+                data.get("contraction_ratio", 0.0),
+                data.get("position_in_range", 0.0),
+                int(bool(data.get("above_sma50", False))),
+                data.get("vol_ratio_7_30", 0.0),
+                data.get("quote_volume", 0.0),
+                data.get("funding_at_watch", 0.0),
+                data.get("price_at_watch", 0.0),
+            ),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error guardando accumulation_watch para %s", data.get("symbol"))
+
+
+def expire_stale_accumulation_watch(max_age_hours: float) -> int:
+    """Marca como 'expired' símbolos no re-confirmados en el último scan
+    (status='watching') o ignitions ya antiguas (status='ignited')."""
+    try:
+        conn = _get_conn()
+        cutoff = _ts_to_iso(time.time() - max_age_hours * 3600)
+        cur = conn.execute(
+            """
+            UPDATE accumulation_watch SET status='expired'
+            WHERE status='watching' AND last_scan < ?
+            """,
+            (cutoff,),
+        )
+        cur2 = conn.execute(
+            """
+            UPDATE accumulation_watch SET status='expired'
+            WHERE status='ignited' AND ignited_at IS NOT NULL AND ignited_at < ?
+            """,
+            (cutoff,),
+        )
+        conn.commit()
+        return cur.rowcount + cur2.rowcount
+    except Exception:
+        logger.exception("Error expirando accumulation_watch")
+        return 0
+
+
+def get_accumulation_watchlist_symbols(limit: int) -> List[str]:
+    """Símbolos activos (watching/ignited) ordenados por coiling_score desc."""
+    try:
+        rows = _get_conn().execute(
+            """
+            SELECT symbol FROM accumulation_watch
+            WHERE status IN ('watching', 'ignited')
+            ORDER BY coiling_score DESC
+            LIMIT ?
+            """,
+            (max(0, int(limit)),),
+        ).fetchall()
+        return [row["symbol"] for row in rows]
+    except Exception:
+        logger.exception("Error obteniendo accumulation watchlist")
+        return []
+
+
+def get_accumulation_watch_map() -> Dict[str, Dict[str, Any]]:
+    """Mapa symbol -> fila completa, para chequeo de disparadores de ignición."""
+    try:
+        rows = _get_conn().execute(
+            "SELECT * FROM accumulation_watch WHERE status IN ('watching', 'ignited')"
+        ).fetchall()
+        return {row["symbol"]: dict(row) for row in rows}
+    except Exception:
+        logger.exception("Error obteniendo accumulation_watch_map")
+        return {}
+
+
+def mark_accumulation_ignited(symbol: str, reason: str) -> None:
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            UPDATE accumulation_watch
+            SET status='ignited', ignited_at=?, ignition_reason=?
+            WHERE symbol=?
+            """,
+            (_now_iso(), reason, symbol),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error marcando ignition para %s", symbol)
+
+
+def get_accumulation_watch_list(limit: int = 50) -> List[Dict[str, Any]]:
+    """Lista completa para dashboard/diagnóstico, ordenada por relevancia."""
+    try:
+        rows = _get_conn().execute(
+            """
+            SELECT * FROM accumulation_watch
+            WHERE status IN ('watching', 'ignited')
+            ORDER BY (status = 'ignited') DESC, coiling_score DESC
+            LIMIT ?
+            """,
+            (max(0, int(limit)),),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except Exception:
+        logger.exception("Error listando accumulation_watch")
+        return []

@@ -65,7 +65,14 @@ def _evaluate_alert(alert: Dict[str, Any], horizon_minutes: int) -> Optional[Dic
         return None  # Aún no ha transcurrido el horizonte
 
     interval, limit = _kline_interval_for_horizon(horizon_minutes)
-    klines = get_klines(symbol, interval=interval, limit=limit)
+    # Solicitar la ventana exacta del horizonte en vez de las últimas N velas.
+    # Esto permite evaluar alertas antiguas correctamente aunque el sistema
+    # haya estado offline: las últimas N velas no cubrirían el rango correcto.
+    horizon_end_ts = alert_ts + horizon_minutes * 60.0
+    start_ms = int(alert_ts * 1000)
+    end_ms   = int(horizon_end_ts * 1000)
+    klines   = get_klines(symbol, interval=interval, limit=limit,
+                          start_time_ms=start_ms, end_time_ms=end_ms)
     if not klines:
         return None
 
@@ -77,14 +84,11 @@ def _evaluate_alert(alert: Dict[str, Any], horizon_minutes: int) -> Optional[Dic
     if not future_klines:
         return None
 
-    # Calcular horizonte objetivo: tomar solo velas hasta horizon_minutes después de la alerta
-    horizon_end_ts = alert_ts + horizon_minutes * 60.0
     window_klines = [
         k for k in future_klines
         if int(k[0]) / 1000.0 <= horizon_end_ts
     ]
     if not window_klines:
-        # Menos de un intervalo de vela disponible
         window_klines = future_klines[:1]
 
     highs  = [float(k[2]) for k in window_klines]

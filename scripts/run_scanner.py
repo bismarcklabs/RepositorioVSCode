@@ -60,6 +60,10 @@ from app.config import (
     SECURITY_ALERTS_ENABLED,
     SECURITY_COLLECTION_INTERVAL_SECONDS,
     CALIBRATED_SETUP_ENABLED,
+    ACCUMULATION_WATCH_ENABLED,
+    ACCUMULATION_SCAN_INTERVAL_HOURS,
+    ACCUMULATION_ANCHOR_TIMES_UTC,
+    ACCUMULATION_WATCHLIST_MAX_SIZE,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -85,7 +89,7 @@ from app.micro_outcome_tracker import run_micro_outcome_tracker
 from app.report_sender import send_winrate_report, send_micro_scalp_report, send_news_report
 from app.news_intelligence import run_news_collection, run_security_collection, evaluate_news_predictions
 from app.auto_trader import evaluate_alert as auto_evaluate
-from app.position_monitor import check_positions, send_positions_report, log_pnl_overview
+from app.position_monitor import check_positions, send_positions_report, log_pnl_overview, recover_gap_positions
 from app.config import AUTO_TRADING_ENABLED, POSITION_REPORT_INTERVAL_SECONDS
 from app.exchanges.aggregator import get_multi_exchange_snapshot
 from app.ml_predictor import predictor as ml_predictor
@@ -97,6 +101,7 @@ from app.trend_continuation import (
     is_short_momentum_continuation,
     calculate_trend_priority_score,
 )
+from app.accumulation_scanner import run_accumulation_scan, check_ignition_trigger
 
 _GEX_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
@@ -623,6 +628,21 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
         candidates = [{"symbol": s, "quote_volume": 0.0} for s in get_top_symbols(limit=20)]
     t_candidates = time.monotonic() - t0
 
+    # Fast-cycle watchlist: símbolos en fase de "coiling" detectados por
+    # Accumulation Watch (fuera del top-50 por volumen) se suman al pipeline
+    # completo para detectar su "ignición" lo antes posible.
+    accumulation_watch_map: Dict[str, Dict[str, Any]] = {}
+    if ENABLE_DATABASE and ACCUMULATION_WATCH_ENABLED:
+        try:
+            existing_syms = {c["symbol"] for c in candidates}
+            accumulation_watch_map = database.get_accumulation_watch_map()
+            for symbol in database.get_accumulation_watchlist_symbols(ACCUMULATION_WATCHLIST_MAX_SIZE):
+                if symbol not in existing_syms:
+                    candidates.append({"symbol": symbol, "quote_volume": 0.0, "preliminary_score": 0.0})
+                    existing_syms.add(symbol)
+        except Exception:
+            logger.exception("Error fusionando accumulation watchlist")
+
     if not candidates:
         logger.warning("Sin candidatos — saltando ciclo")
         return []
@@ -651,7 +671,14 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
 
     t0 = time.monotonic()
     results: List[Dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # 6 workers externos × 11 internos = 66 requests HTTP simultáneos a Binance.
+    # Con 10 workers eran 110 simultáneos → Binance throttlea → 30s+ por símbolo.
+    # Con 4 workers (44 simultáneos) no hay throttling pero el ciclo se estanca
+    # en ~90-100s: con tan poco paralelismo entre símbolos, la latencia "honesta"
+    # por símbolo (api=4-8s, ver HANDOFF.md sección 2.4) no tiene con qué solaparse.
+    # 66 deja margen frente al umbral de throttling (~110) mientras duplica el
+    # paralelismo disponible.
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_map = {
             executor.submit(_scan_symbol, c["symbol"], c, market_regime): c["symbol"]
             for c in candidates
@@ -669,6 +696,24 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
         ),
         reverse=True,
     )
+
+    # Accumulation Watch: detectar "ignición" (volumen relativo súbito o
+    # funding cruzando hacia/bajo cero) en símbolos de la fast-cycle watchlist.
+    if accumulation_watch_map:
+        for r in results:
+            watch_entry = accumulation_watch_map.get(r["symbol"])
+            if not watch_entry or watch_entry.get("status") != "watching":
+                continue
+            try:
+                reason = check_ignition_trigger(watch_entry, r.get("technical") or {}, r.get("funding", 0.0))
+            except Exception:
+                reason = None
+            if reason:
+                logger.info(
+                    "IGNITION %-12s | coiling_score=%.1f | %s",
+                    r["symbol"], watch_entry.get("coiling_score", 0.0), reason,
+                )
+                database.mark_accumulation_ignited(r["symbol"], reason)
 
     t0 = time.monotonic()
     if ENABLE_DATABASE:
@@ -745,7 +790,7 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Escáner de cripto autónomo")
-    parser.add_argument("--interval", type=int, default=15, help="Segundos entre ciclos (default: 15)")
+    parser.add_argument("--interval", type=int, default=60, help="Segundos entre ciclos (default: 60)")
     parser.add_argument("--limit", type=int, default=SCANNER_CANDIDATE_LIMIT, help="Candidatos a escanear")
     args = parser.parse_args()
 
@@ -754,6 +799,32 @@ def main() -> None:
     if ENABLE_DATABASE:
         database.init_db()
         _init_cooldown_from_db()
+
+    if AUTO_TRADING_ENABLED:
+        try:
+            recover_gap_positions()
+        except Exception:
+            logger.exception("Error en recover_gap_positions al inicio")
+
+    # Actualizar caché histórica incremental (solo las velas nuevas desde la última ejecución).
+    # No bloquea el scanner si falla — es un best-effort para mantener los scripts de análisis
+    # al día. Para símbolos con gap de días, descarga las velas faltantes en segundos.
+    if ENABLE_DATABASE:
+        try:
+            from app.historical_cache import ensure_history
+            _CACHE_SYMBOLS = [
+                "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "BNBUSDT",
+                "ADAUSDT", "DOGEUSDT", "LINKUSDT", "AVAXUSDT", "NEARUSDT",
+            ]
+            _updated = 0
+            for _sym in _CACHE_SYMBOLS:
+                for _iv in ("1h", "4h", "1d"):
+                    n = ensure_history(_sym, _iv, source="futures")
+                    _updated += n
+            if _updated:
+                logger.info("Cache histórica actualizada: +%d velas nuevas", _updated)
+        except Exception:
+            logger.warning("Error actualizando caché histórica al inicio (no crítico)")
 
     ml_predictor.load()
 
@@ -773,6 +844,11 @@ def main() -> None:
     _last_micro_report_ts = 0.0    # epoch del último reporte de micro-scalping
     _last_position_report_ts = 0.0 # epoch del último reporte de posiciones
     _last_pnl_log_ts = 0.0          # epoch del último log de PnL acumulado
+    _last_purge_ts = 0.0           # epoch de la última purga de snapshots
+    _last_accumulation_scan_ts = 0.0       # epoch del último Accumulation Watch scan
+    _accumulation_anchor_done: Dict[Tuple[int, int], str] = {}  # (h, m) -> "YYYY-MM-DD"
+    _accumulation_executor = ThreadPoolExecutor(max_workers=1)
+    _accumulation_future = None
 
     # Primer ciclo inmediato; luego esperar entre ciclos
     while True:
@@ -822,6 +898,44 @@ def main() -> None:
                     _last_pnl_log_ts = time.time()
                 except Exception:
                     logger.exception("Error en log_pnl_overview")
+
+        # Purga de snapshots viejos — una vez cada 6h para mantener la DB compacta
+        if ENABLE_DATABASE:
+            if time.time() - _last_purge_ts >= 21_600:
+                try:
+                    database.purge_old_snapshots()
+                    _last_purge_ts = time.time()
+                except Exception:
+                    logger.exception("Error en purge_old_snapshots")
+
+        # Accumulation Watch: cadencia regular (ACCUMULATION_SCAN_INTERVAL_HOURS)
+        # MÁS corridas ancla en ACCUMULATION_ANCHOR_TIMES_UTC (30 min antes de las
+        # ventanas de "ignición" observadas: apertura Europa 07-08h y sesión US 14h).
+        # Las corridas ancla son ADICIONALES a la cadencia regular, no la reemplazan.
+        if ENABLE_DATABASE and ACCUMULATION_WATCH_ENABLED:
+            _run_accumulation = False
+            if time.time() - _last_accumulation_scan_ts >= ACCUMULATION_SCAN_INTERVAL_HOURS * 3600:
+                _run_accumulation = True
+
+            _utc_now = time.gmtime()
+            _today_str = time.strftime("%Y-%m-%d", _utc_now)
+            for _anchor_h, _anchor_m in ACCUMULATION_ANCHOR_TIMES_UTC:
+                _anchor_key = (_anchor_h, _anchor_m)
+                if (
+                    _utc_now.tm_hour == _anchor_h
+                    and _utc_now.tm_min >= _anchor_m
+                    and _accumulation_anchor_done.get(_anchor_key) != _today_str
+                ):
+                    _run_accumulation = True
+                    _accumulation_anchor_done[_anchor_key] = _today_str
+
+            if _run_accumulation and (_accumulation_future is None or _accumulation_future.done()):
+                try:
+                    _accumulation_future = _accumulation_executor.submit(run_accumulation_scan)
+                except Exception:
+                    logger.exception("Error iniciando Accumulation Watch scan")
+                finally:
+                    _last_accumulation_scan_ts = time.time()
 
         # Reporte de win rate periódico — basado en tiempo real, no en ciclos
         if ENABLE_DATABASE and WINRATE_REPORT_ENABLED:

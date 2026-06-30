@@ -12,9 +12,12 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 from app import database
+import datetime as _dt
+
 from app.config import (
     AUTO_TRADING_ENABLED,
     AUTO_TRADING_MODE,
+    AUTO_TRADING_EXCHANGE,
     AUTO_TRADING_CAPITAL_USDT,
     AUTO_TRADING_MAX_POSITIONS,
     AUTO_TRADING_MARKETS,
@@ -28,6 +31,8 @@ from app.config import (
     ENABLE_SETUP_GATE,
     SETUP_ALERT_GRADES,
     ML_ENABLED,
+    AUTO_TRADING_SESSION_GATE_ENABLED,
+    AUTO_TRADING_SESSION_ACTIVE_HOURS,
     ML_THRESHOLD,
     BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE,
     AUTO_TRADING_USE_CALIBRATED_GRADE,
@@ -35,6 +40,8 @@ from app.config import (
     AUTO_TRADING_C_SHORT_MIN_SCORE,
     AUTO_TRADING_C_LONG_MIN_SCORE,
     AUTO_TRADING_COUNTERTREND_MIN_SCORE,
+    AUTO_TRADING_LONG_MIN_SCORE,
+    AUTO_TRADING_SHORT_MIN_SCORE,
     AUTO_TRADING_LOSS_COOLDOWN_COUNT,
     AUTO_TRADING_LOSS_COOLDOWN_HOURS,
 )
@@ -139,8 +146,18 @@ def _passes_gates(result: Dict[str, Any],
     if action not in eligible:
         return False, f"accion {action} no habilitada"
 
-    if score < AUTO_TRADING_MIN_SCORE:
-        return False, f"score {score} < min {AUTO_TRADING_MIN_SCORE}"
+    if AUTO_TRADING_SESSION_GATE_ENABLED and AUTO_TRADING_SESSION_ACTIVE_HOURS:
+        hour_utc = _dt.datetime.utcnow().hour
+        if hour_utc not in AUTO_TRADING_SESSION_ACTIVE_HOURS:
+            return False, f"sesion inactiva hora={hour_utc:02d}h UTC (activas: 09-22h)"
+
+    # Threshold diferenciado por dirección (datos WR: SHORT EV negativo en mercado alcista)
+    _dir_min = (AUTO_TRADING_LONG_MIN_SCORE  if action in ("LONG_FUTURES", "BUY_SPOT")
+                else AUTO_TRADING_SHORT_MIN_SCORE if action in ("SHORT_FUTURES", "SELL_SPOT")
+                else AUTO_TRADING_MIN_SCORE)
+    effective_min = max(AUTO_TRADING_MIN_SCORE, _dir_min)
+    if score < effective_min:
+        return False, f"score {score} < min {effective_min} ({action})"
 
     regime = result.get("market_regime") or rec.get("market_regime") or {}
     if regime.get("active") and is_countertrend_action(action, regime):
@@ -263,29 +280,58 @@ def evaluate_alert(result: Dict[str, Any],
             )
             return None
 
+        # ── Orden real en KuCoin (si aplica) ──────────────────────────────
+        exchange_name    = "paper"
+        exchange_order_id = None
+
+        if AUTO_TRADING_MODE == "real" and AUTO_TRADING_EXCHANGE == "kucoin":
+            from app.exchanges import kucoin_trader
+            from app.exchanges.symbol_map import get_kucoin_spot_symbol
+            from app.exchanges.symbol_map import get_normalized
+            normalized = get_normalized(result["symbol"]) or result["symbol"].replace("USDT", "")
+            kc_spot    = get_kucoin_spot_symbol(normalized) or f"{normalized}-USDT"
+            kc_result  = kucoin_trader.open_order(
+                action, result["symbol"], normalized, kc_spot,
+                size_usdt, entry_price, leverage,
+            )
+            if not kc_result.ok:
+                logger.error(
+                    "AUTO REAL ORDER FAILED %s %s: %s — posicion NO abierta",
+                    action, result["symbol"], kc_result.error,
+                )
+                return None
+            exchange_name     = "kucoin"
+            exchange_order_id = kc_result.order_id
+            logger.info(
+                "AUTO REAL ORDER OK %s %s | kucoin_order_id=%s",
+                action, result["symbol"], exchange_order_id,
+            )
+
         position_id = database.insert_auto_position({
-            "alert_id":    alert_id,
-            "symbol":      result["symbol"],
-            "action":      action,
-            "mode":        AUTO_TRADING_MODE,
-            "open_time":   result.get("timestamp", ""),
-            "entry_price": entry_price,
-            "size_usdt":   size_usdt,
-            "leverage":    leverage,
-            "tp1":         tp1,
-            "tp2":         tp2,
-            "sl":          sl,
-            "sl_current":  sl,
+            "alert_id":          alert_id,
+            "symbol":            result["symbol"],
+            "action":            action,
+            "mode":              AUTO_TRADING_MODE,
+            "exchange":          exchange_name,
+            "exchange_order_id": exchange_order_id,
+            "open_time":         result.get("timestamp", ""),
+            "entry_price":       entry_price,
+            "size_usdt":         size_usdt,
+            "leverage":          leverage,
+            "tp1":               tp1,
+            "tp2":               tp2,
+            "sl":                sl,
+            "sl_current":        sl,
         })
 
         tier = "3%" if score >= AUTO_TRADING_TIER1_SCORE else "2%" if score >= AUTO_TRADING_TIER2_SCORE else "1%"
         logger.info(
             "AUTO ABRIR %s %s | entry=%.6g | $%.0f (%s) | lev=%dx | "
-            "TP1=%s TP2=%s SL=%.6g | mode=%s | pos_id=%d",
+            "TP1=%s TP2=%s SL=%.6g | mode=%s | exchange=%s | pos_id=%d",
             action, result["symbol"], entry_price, size_usdt, tier, leverage,
             f"{tp1:.6g}" if tp1 else "—",
             f"{tp2:.6g}" if tp2 else "—",
-            sl, AUTO_TRADING_MODE, position_id,
+            sl, AUTO_TRADING_MODE, exchange_name, position_id,
         )
         try:
             _notify_open(result["symbol"], action, entry_price, size_usdt,

@@ -13,6 +13,12 @@ if DOTENV_PATH.exists():
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 
+# ── KuCoin credentials (requeridas solo para AUTO_TRADING_EXCHANGE=kucoin real) ─
+KUCOIN_API_KEY    = os.getenv("KUCOIN_API_KEY", "")
+KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET", "")
+KUCOIN_PASSPHRASE = os.getenv("KUCOIN_PASSPHRASE", "")
+KUCOIN_SANDBOX    = os.getenv("KUCOIN_SANDBOX", "false").lower() == "true"
+
 # ── Binance base URLs ──────────────────────────────────────────────────────
 BINANCE_FUTURES_BASE_URL = os.getenv("BINANCE_FUTURES_BASE_URL", "https://fapi.binance.com")
 
@@ -103,6 +109,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # ── Auto-trading ──────────────────────────────────────────────────────────
 AUTO_TRADING_ENABLED       = os.getenv("AUTO_TRADING_ENABLED", "false").lower() == "true"
 AUTO_TRADING_MODE          = os.getenv("AUTO_TRADING_MODE", "paper")          # paper | real
+AUTO_TRADING_EXCHANGE      = os.getenv("AUTO_TRADING_EXCHANGE", "kucoin")     # kucoin (único soportado)
 AUTO_TRADING_CAPITAL_USDT  = float(os.getenv("AUTO_TRADING_CAPITAL_USDT", "100"))
 AUTO_TRADING_MAX_POSITIONS = int(os.getenv("AUTO_TRADING_MAX_POSITIONS", "5"))
 AUTO_TRADING_MARKETS       = os.getenv("AUTO_TRADING_MARKETS", "futures")     # futures | spot | both
@@ -119,8 +126,20 @@ AUTO_TRADING_ALLOWED_CALIBRATED_GRADES: set = {
 AUTO_TRADING_C_SHORT_MIN_SCORE = int(os.getenv("AUTO_TRADING_C_SHORT_MIN_SCORE", "75"))
 AUTO_TRADING_C_LONG_MIN_SCORE = int(os.getenv("AUTO_TRADING_C_LONG_MIN_SCORE", "85"))
 AUTO_TRADING_COUNTERTREND_MIN_SCORE = int(os.getenv("AUTO_TRADING_COUNTERTREND_MIN_SCORE", "90"))
+# Score mínimo diferenciado por dirección (datos históricos: SHORT EV negativo, LONG positivo)
+# LONG 75+ → WR_adj 55-60%; SHORT necesita convicción mayor para compensar mercado alcista
+AUTO_TRADING_LONG_MIN_SCORE  = int(os.getenv("AUTO_TRADING_LONG_MIN_SCORE",  "75"))
+AUTO_TRADING_SHORT_MIN_SCORE = int(os.getenv("AUTO_TRADING_SHORT_MIN_SCORE", "80"))
 AUTO_TRADING_LOSS_COOLDOWN_COUNT = int(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_COUNT", "2"))
 AUTO_TRADING_LOSS_COOLDOWN_HOURS = float(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_HOURS", "6"))
+# Gate de sesión horaria UTC: bloquea entradas en horas de baja volatilidad
+# Validado con 90 días × 25 símbolos: Asia (00-08h) tiene EV negativo con SL2%/TP3%
+# Formato: "HH-HH" (inclusive inicio, exclusivo fin), vacío = sin gate
+AUTO_TRADING_SESSION_GATE_ENABLED = os.getenv("AUTO_TRADING_SESSION_GATE_ENABLED", "true").lower() == "true"
+AUTO_TRADING_SESSION_ACTIVE_HOURS: set = {
+    h for part in os.getenv("AUTO_TRADING_SESSION_ACTIVE_HOURS", "9-22").split(",")
+    for h in (range(int(part.split("-")[0]), int(part.split("-")[1])) if "-" in part else [int(part)])
+}
 # Tiers de sizing: score >= umbral → % del capital
 AUTO_TRADING_TIER1_SCORE   = int(os.getenv("AUTO_TRADING_TIER1_SCORE", "80"))   # 3%
 AUTO_TRADING_TIER2_SCORE   = int(os.getenv("AUTO_TRADING_TIER2_SCORE", "75"))   # 2%
@@ -180,6 +199,34 @@ BTC_RISK_ON_RETURN_5M = float(os.getenv("BTC_RISK_ON_RETURN_5M", "0.15"))
 BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE = int(os.getenv("BTC_REGIME_BLOCK_COUNTERTREND_BELOW_SCORE", "85"))
 BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY = int(os.getenv("BTC_REGIME_COUNTERTREND_CONFIDENCE_PENALTY", "10"))
 BTC_REGIME_ALIGNED_CONFIDENCE_BOOST = int(os.getenv("BTC_REGIME_ALIGNED_CONFIDENCE_BOOST", "5"))
+
+# ── Accumulation Watch (canal para tokens fuera del top-50 por volumen) ──
+# Detecta tokens en fase de "coiling" (contracción de volatilidad + acumulación
+# de volumen) que aún no califican para el scanner principal ($50M+), antes de
+# su "ignición" (breakout tipo FOMO observado en HOME/ID/LAB/BEAT/RAVE, etc.)
+ACCUMULATION_WATCH_ENABLED = os.getenv("ACCUMULATION_WATCH_ENABLED", "true").lower() == "true"
+ACCUMULATION_MIN_QUOTE_VOLUME_USDT = float(os.getenv("ACCUMULATION_MIN_QUOTE_VOLUME_USDT", "2000000"))  # $2M
+ACCUMULATION_COILING_SCORE_THRESHOLD = float(os.getenv("ACCUMULATION_COILING_SCORE_THRESHOLD", "45"))
+ACCUMULATION_SCAN_INTERVAL_HOURS = float(os.getenv("ACCUMULATION_SCAN_INTERVAL_HOURS", "6"))
+ACCUMULATION_WATCHLIST_MAX_SIZE = int(os.getenv("ACCUMULATION_WATCHLIST_MAX_SIZE", "20"))
+ACCUMULATION_WATCH_EXPIRE_HOURS = float(os.getenv("ACCUMULATION_WATCH_EXPIRE_HOURS", "48"))
+# Disparadores de "ignición" para símbolos en watchlist (volumen relativo del
+# pipeline principal, o funding cruzando hacia/por debajo de cero)
+ACCUMULATION_IGNITION_VOLUME_MULT = float(os.getenv("ACCUMULATION_IGNITION_VOLUME_MULT", "2.5"))
+ACCUMULATION_FUNDING_DROP_THRESHOLD = float(os.getenv("ACCUMULATION_FUNDING_DROP_THRESHOLD", "0.0001"))
+# Horarios UTC ancla (30 min antes de apertura Europa 07-08h y sesión US 14h,
+# donde se concentró el 60% de las igniciones observadas) — corren ADEMÁS de
+# la cadencia regular de ACCUMULATION_SCAN_INTERVAL_HOURS, no en su lugar.
+ACCUMULATION_ANCHOR_TIMES_UTC: list = []
+for _part in os.getenv("ACCUMULATION_ANCHOR_TIMES_UTC", "06:30,13:30").split(","):
+    _part = _part.strip()
+    if not _part:
+        continue
+    try:
+        _h, _m = _part.split(":")
+        ACCUMULATION_ANCHOR_TIMES_UTC.append((int(_h), int(_m)))
+    except ValueError:
+        continue
 
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"

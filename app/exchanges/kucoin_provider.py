@@ -1,7 +1,9 @@
-"""Provider Coinbase Exchange — endpoints públicos, sin autenticación.
+"""Provider KuCoin — endpoints públicos spot, sin autenticación.
 
-API base: https://api.exchange.coinbase.com
-Documentación: https://docs.cdp.coinbase.com/exchange/reference
+API base: https://api.kucoin.com/api/v1
+Documentación: https://www.kucoin.com/docs/rest/spot-trading/market-data
+
+Símbolos en formato KuCoin: "BTC-USDT", "ETH-USDT", etc.
 """
 import logging
 import time
@@ -18,11 +20,10 @@ from app.exchanges.base import (
     _failed_ticker,
 )
 
-logger = logging.getLogger("exchanges.coinbase")
+logger = logging.getLogger("exchanges.kucoin")
 
-_BASE = "https://api.exchange.coinbase.com"
+_BASE = "https://api.kucoin.com"
 
-# Cache compartido con lock (mismo patrón que market_data.py)
 _cache: Dict[str, Tuple[Any, float]] = {}
 _cache_lock = threading.Lock()
 _session_lock = threading.Lock()
@@ -36,7 +37,7 @@ def _get_session() -> requests.Session:
             _session = requests.Session()
             _session.headers.update({
                 "User-Agent": "crypto-dashboard/2.0",
-                "Accept": "application/json",
+                "Accept":     "application/json",
             })
         return _session
 
@@ -59,39 +60,48 @@ def _cache_set(key: str, value: Any, ttl: float) -> None:
 
 
 def _fetch(path: str, params: Optional[Dict] = None, ttl: float = 10.0) -> Optional[Any]:
-    key = f"cb:{path}|{sorted((params or {}).items())}"
+    key = f"kc:{path}|{sorted((params or {}).items())}"
     cached = _cache_get(key)
     if cached is not None:
         return cached
     try:
         resp = _get_session().get(f"{_BASE}{path}", params=params or {}, timeout=4)
         resp.raise_for_status()
-        data = resp.json()
+        body = resp.json()
+        if body.get("code") != "200000":
+            logger.debug("kucoin api error %s: %s", path, body.get("msg"))
+            return None
+        data = body.get("data")
         _cache_set(key, data, ttl)
         return data
     except Exception as exc:
-        logger.debug("coinbase fetch error %s: %s", path, exc)
+        logger.debug("kucoin fetch error %s: %s", path, exc)
         return None
 
 
-class CoinbaseProvider:
-    name = "coinbase"
+class KuCoinProvider:
+    name = "kucoin"
 
     def get_ticker(self, symbol: str, normalized_symbol: str) -> ExchangeTicker:
         """
-        GET /products/{product-id}/ticker
-        Retorna: price, bid, ask, volume, time
+        GET /api/v1/market/orderbook/level1?symbol=BTC-USDT
+        Retorna: price (last trade), bestBid, bestAsk, size, time
+        Volumen 24h: GET /api/v1/market/stats?symbol=BTC-USDT → vol field
         """
-        data = _fetch(f"/products/{symbol}/ticker", ttl=8.0)
-        if not data or "price" not in data:
+        l1 = _fetch("/api/v1/market/orderbook/level1", {"symbol": symbol}, ttl=8.0)
+        if not l1 or "price" not in l1:
             return _failed_ticker(self.name, symbol, normalized_symbol,
-                                  "no data" if not data else "missing price")
+                                  "no data" if not l1 else "missing price")
         try:
-            price = float(data["price"])
-            bid   = float(data["bid"])   if data.get("bid")   else None
-            ask   = float(data["ask"])   if data.get("ask")   else None
-            vol   = float(data["volume"]) if data.get("volume") else None
+            price = float(l1["price"])
+            bid   = float(l1["bestBid"]) if l1.get("bestBid") else None
+            ask   = float(l1["bestAsk"]) if l1.get("bestAsk") else None
             spread_pct = (ask - bid) / bid * 100 if bid and ask else None
+
+            # Volumen 24h en llamada separada (misma caché TTL)
+            stats = _fetch("/api/v1/market/stats", {"symbol": symbol}, ttl=30.0)
+            vol = float(stats["volValue"]) if stats and stats.get("volValue") else None
+
             return ExchangeTicker(
                 exchange=self.name,
                 symbol=symbol,
@@ -101,24 +111,24 @@ class CoinbaseProvider:
                 bid=bid,
                 ask=ask,
                 spread_pct=round(spread_pct, 4) if spread_pct is not None else None,
-                timestamp=data.get("time"),
+                timestamp=str(l1.get("time", "")),
             )
         except Exception as exc:
-            logger.debug("coinbase ticker parse error %s: %s", symbol, exc)
+            logger.debug("kucoin ticker parse error %s: %s", symbol, exc)
             return _failed_ticker(self.name, symbol, normalized_symbol, str(exc))
 
     def get_orderbook(self, symbol: str, normalized_symbol: str,
                       limit: int = 50) -> ExchangeOrderBook:
         """
-        GET /products/{product-id}/book?level=2
-        level=2: top 50 bids/asks agregados.
+        GET /api/v1/market/orderbook/level2_20?symbol=BTC-USDT   (level2_20 o level2_100)
+        Retorna: {"bids": [["price", "size"], ...], "asks": [...], "time": ms}
         """
-        data = _fetch(f"/products/{symbol}/book", params={"level": 2}, ttl=5.0)
+        endpoint = "/api/v1/market/orderbook/level2_20" if limit <= 20 else "/api/v1/market/orderbook/level2_100"
+        data = _fetch(endpoint, {"symbol": symbol}, ttl=5.0)
         if not data or "bids" not in data:
             return _failed_orderbook(self.name, symbol, normalized_symbol,
                                      "no data" if not data else "missing bids")
         try:
-            # Cada entrada: [price, size, num_orders]
             bids = [(float(b[0]), float(b[1])) for b in data["bids"][:limit]]
             asks = [(float(a[0]), float(a[1])) for a in data["asks"][:limit]]
             return ExchangeOrderBook(
@@ -127,40 +137,41 @@ class CoinbaseProvider:
                 normalized_symbol=normalized_symbol,
                 bids=bids,
                 asks=asks,
+                timestamp=str(data.get("time", "")),
             )
         except Exception as exc:
-            logger.debug("coinbase orderbook parse error %s: %s", symbol, exc)
+            logger.debug("kucoin orderbook parse error %s: %s", symbol, exc)
             return _failed_orderbook(self.name, symbol, normalized_symbol, str(exc))
 
     def get_klines(self, symbol: str, interval: str = "1m",
                    limit: int = 100) -> List[ExchangeKline]:
         """
-        GET /products/{product-id}/candles?granularity=<seconds>
-        Coinbase usa granularidad en segundos: 60, 300, 900, 3600, 21600, 86400.
-        Retorna: [[time_sec, low, high, open, close, volume], ...]  (desc)
-        Máx 300 velas por llamada.
+        GET /api/v1/market/candles?type=1min&symbol=BTC-USDT
+        Intervalo: 1min, 3min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 6hour, 8hour, 12hour, 1day, 1week
+        Retorna: [["startAt", "open", "close", "high", "low", "volume", "turnover"], ...]
+        Nota: índices distintos a Coinbase — close está en [2], high en [3], low en [4]
         """
         _interval_map = {
-            "1m": 60, "5m": 300, "15m": 900, "1h": 3600,
-            "6h": 21600, "1d": 86400,
+            "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min",
+            "30m": "30min", "1h": "1hour", "4h": "4hour", "1d": "1day",
         }
-        gran = _interval_map.get(interval, 60)
-        data = _fetch(f"/products/{symbol}/candles",
-                      params={"granularity": gran}, ttl=30.0)
+        kc_interval = _interval_map.get(interval, "1min")
+        data = _fetch("/api/v1/market/candles",
+                      {"type": kc_interval, "symbol": symbol}, ttl=30.0)
         if not isinstance(data, list):
             return []
         try:
             klines = []
-            for row in reversed(data[:limit]):  # desc → asc
+            for row in reversed(data[:limit]):   # KuCoin devuelve desc → asc
                 klines.append(ExchangeKline(
                     open_time_ms=int(row[0]) * 1000,
-                    open=float(row[3]),
-                    high=float(row[2]),
-                    low=float(row[1]),
-                    close=float(row[4]),
+                    open=float(row[1]),
+                    high=float(row[3]),
+                    low=float(row[4]),
+                    close=float(row[2]),
                     volume=float(row[5]),
                 ))
             return klines
         except Exception as exc:
-            logger.debug("coinbase klines parse error %s: %s", symbol, exc)
+            logger.debug("kucoin klines parse error %s: %s", symbol, exc)
             return []

@@ -17,6 +17,7 @@ from app.exchanges.base import ExchangeTicker
 from app.exchanges.binance_provider import BinanceProvider
 from app.exchanges.coinbase_provider import CoinbaseProvider
 from app.exchanges.kraken_provider import KrakenProvider
+from app.exchanges.kucoin_provider import KuCoinProvider
 from app.exchanges.symbol_map import get_exchange_symbol, is_supported
 
 logger = logging.getLogger("exchanges.aggregator")
@@ -25,8 +26,9 @@ logger = logging.getLogger("exchanges.aggregator")
 _BINANCE  = BinanceProvider()
 _COINBASE = CoinbaseProvider()
 _KRAKEN   = KrakenProvider()
+_KUCOIN   = KuCoinProvider()
 
-_EXTERNAL_PROVIDERS = [_COINBASE, _KRAKEN]
+_EXTERNAL_PROVIDERS = [_COINBASE, _KRAKEN, _KUCOIN]
 
 # ── Historial de precios en memoria para detectar tendencia externa ────────
 # key = "exchange:normalized_symbol"  value = deque de precios (float)
@@ -141,9 +143,15 @@ def _calculate_confirmation(tickers: Dict[str, ExchangeTicker],
     else:
         base_conf = 30
 
-    # Factor de disponibilidad: 1 exchange externo → 0.80×, 2 → 1.0×
-    avail_factor = 0.80 if len(external_ok) == 1 else 1.0
-    multi_conf = round(base_conf * avail_factor, 1)
+    # Factor de disponibilidad: 1 → 0.80×, 2 → 1.0×, 3 (todos) → 1.10×
+    n_ext = len(external_ok)
+    if n_ext == 1:
+        avail_factor = 0.80
+    elif n_ext == 2:
+        avail_factor = 1.0
+    else:
+        avail_factor = 1.10  # los 3 exchanges externos coinciden
+    multi_conf = round(min(base_conf * avail_factor, 100.0), 1)
 
     warnings: List[str] = []
     if deviation_pct > 0.50:

@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(PYTHONIOENCODING=utf-8 python -m pytest tests/test_setup_calibrator.py -q)"
+      "Bash(PYTHONIOENCODING=utf-8 python -m pytest tests/test_setup_calibrator.py -q)",
+      "WebFetch(domain:www.cyberpuerta.mx)"
     ]
   }
 }
