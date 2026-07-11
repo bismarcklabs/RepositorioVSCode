@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from app import database
 from app.market_data import get_klines
-from app.config import MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES
+from app.config import MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES, MICRO_SCALP_TRADE_SIZE_USDT
 
 logger = logging.getLogger("micro_outcome_tracker")
 
@@ -128,6 +128,8 @@ def _evaluate_micro_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         pnl_pct = (entry - exit_price) / entry * 100.0
 
+    pnl_usdt = round(pnl_pct / 100.0 * MICRO_SCALP_TRADE_SIZE_USDT, 4)
+
     return {
         "id": alert["id"],
         "outcome": outcome,
@@ -136,6 +138,7 @@ def _evaluate_micro_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "hit_tp2": hit_tp2,
         "hit_stop": hit_stop,
         "pnl_pct": round(pnl_pct, 4),
+        "pnl_usdt": pnl_usdt,
         "max_favorable_pct": round(max_favorable, 4),
         "max_adverse_pct": round(max_adverse, 4),
     }
@@ -161,6 +164,7 @@ def run_micro_outcome_tracker() -> None:
                 result["pnl_pct"],
                 result["max_favorable_pct"],
                 result["max_adverse_pct"],
+                result["pnl_usdt"],
             )
             logger.info(
                 "Micro outcome [%s %s] -> %s (TP1=%s TP2=%s SL=%s)",

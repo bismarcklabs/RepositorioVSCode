@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 from typing import Any, Dict, List
 
 from app.log_setup import setup_logging
@@ -320,12 +321,12 @@ pnl_c2.metric(
     delta_color="off",
 )
 pnl_c3.metric(
-    "⚡ Micro-scalping (%)",
-    f"{_pm.get('pnl_pct_total', 0.0):+.2f}%",
-    f"WR {_pm.get('winrate_pct', 0.0):.1f}% · {_pm.get('closed', 0)} cerradas / {_pm.get('open', 0)} abiertas",
+    "⚡ Micro-scalping (USDT)",
+    f"{_pm.get('pnl_usdt', 0.0):+.2f}$",
+    f"WR {_pm.get('winrate_pct', 0.0):.1f}% · {_pm.get('closed', 0)} cerradas / {_pm.get('open', 0)} abiertas · {_pm.get('pnl_pct_total', 0.0):+.2f}% acum",
     delta_color="off",
 )
-st.caption("PnL realizado acumulado (histórico, paper) · Futures/Spot en USDT · Micro-scalp en % acumulado")
+st.caption("PnL realizado acumulado (histórico, paper) · 25 USDT/trade micro · Futures/Spot en USDT")
 
 
 # ── Sección 1: Oportunidades accionables ─────────────────────────────────
@@ -670,18 +671,17 @@ if display_rows:
 
     with col_d:
         st.markdown("**CVD 1h / 15m** — flujo acumulado y aceleración reciente.")
-        # Pre-melt para compatibilidad con pandas 3.0 + plotly express
-        _df_cvd = (
-            df_c.sort_values("cvd", ascending=False)[["symbol", "cvd", "cvd_15m"]]
-            .melt(id_vars="symbol", value_vars=["cvd", "cvd_15m"],
-                  var_name="Ventana", value_name="CVD")
-        )
-        fig = px.bar(
-            _df_cvd, x="symbol", y="CVD",
-            color="Ventana", barmode="group",
-            title="CVD 1h vs CVD 15m",
-            color_discrete_map={"cvd": "#6b7280", "cvd_15m": "#10b981"},
-        )
+        _df_cvd_src = df_c.sort_values("cvd", ascending=False)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="cvd 1h", x=_df_cvd_src["symbol"], y=_df_cvd_src["cvd"],
+            marker_color="#6b7280",
+        ))
+        fig.add_trace(go.Bar(
+            name="cvd 15m", x=_df_cvd_src["symbol"], y=_df_cvd_src["cvd_15m"],
+            marker_color="#10b981",
+        ))
+        fig.update_layout(barmode="group", title="CVD 1h vs CVD 15m")
         st.plotly_chart(fig, use_container_width=True)
 
     col_e, col_f = st.columns(2)

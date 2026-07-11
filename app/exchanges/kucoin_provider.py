@@ -65,7 +65,7 @@ def _fetch(path: str, params: Optional[Dict] = None, ttl: float = 10.0) -> Optio
     if cached is not None:
         return cached
     try:
-        resp = _get_session().get(f"{_BASE}{path}", params=params or {}, timeout=4)
+        resp = _get_session().get(f"{_BASE}{path}", params=params or {}, timeout=2)
         resp.raise_for_status()
         body = resp.json()
         if body.get("code") != "200000":

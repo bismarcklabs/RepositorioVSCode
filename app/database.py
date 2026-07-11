@@ -121,6 +121,7 @@ def _migrate_schema() -> None:
         ("micro_scalp_alerts", "pnl_pct",          "REAL DEFAULT 0"),
         ("micro_scalp_alerts", "max_favorable_pct","REAL DEFAULT 0"),
         ("micro_scalp_alerts", "max_adverse_pct",  "REAL DEFAULT 0"),
+        ("micro_scalp_alerts", "pnl_usdt",         "REAL DEFAULT 0"),
         # exchange tracking en auto_positions (real trading)
         ("auto_positions", "exchange",          "TEXT NOT NULL DEFAULT 'paper'"),
         ("auto_positions", "exchange_order_id", "TEXT"),
@@ -812,6 +813,7 @@ def close_micro_scalp_alert(
     pnl_pct: float,
     max_favorable_pct: float,
     max_adverse_pct: float,
+    pnl_usdt: float = 0.0,
 ) -> None:
     try:
         conn = _get_conn()
@@ -827,14 +829,15 @@ def close_micro_scalp_alert(
                 hit_stop = ?,
                 pnl_pct = ?,
                 max_favorable_pct = ?,
-                max_adverse_pct = ?
+                max_adverse_pct = ?,
+                pnl_usdt = ?
             WHERE id = ?
             """,
             (
                 _now_iso(), exit_price, outcome,
                 int(hit_tp1), int(hit_tp2), int(hit_stop),
                 pnl_pct, max_favorable_pct, max_adverse_pct,
-                micro_alert_id,
+                pnl_usdt, micro_alert_id,
             ),
         )
         conn.commit()
@@ -1690,26 +1693,28 @@ def get_pnl_overview() -> Dict[str, Any]:
     ms_row = conn.execute(
         """
         SELECT
-            COALESCE(SUM(CASE WHEN status = 'closed' THEN pnl_pct ELSE 0 END), 0.0) AS pnl_pct_total,
-            COALESCE(AVG(CASE WHEN status = 'closed' THEN pnl_pct END), 0.0) AS pnl_pct_avg,
+            COALESCE(SUM(CASE WHEN status = 'closed' THEN pnl_pct  ELSE 0 END), 0.0) AS pnl_pct_total,
+            COALESCE(AVG(CASE WHEN status = 'closed' THEN pnl_pct  END),        0.0) AS pnl_pct_avg,
+            COALESCE(SUM(CASE WHEN status = 'closed' THEN pnl_usdt ELSE 0 END), 0.0) AS pnl_usdt_total,
             SUM(CASE WHEN status = 'closed' THEN 1 ELSE 0 END) AS closed,
-            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_count,
+            SUM(CASE WHEN status = 'open'   THEN 1 ELSE 0 END) AS open_count,
             SUM(CASE WHEN outcome IN ('win', 'partial') THEN 1 ELSE 0 END) AS wins,
-            SUM(CASE WHEN outcome = 'loss' THEN 1 ELSE 0 END) AS losses
+            SUM(CASE WHEN outcome = 'loss'              THEN 1 ELSE 0 END) AS losses
         FROM micro_scalp_alerts
         """
     ).fetchone()
     ms_closed = ms_row["closed"] or 0
-    ms_wins = ms_row["wins"] or 0
+    ms_wins   = ms_row["wins"]   or 0
     ms_losses = ms_row["losses"] or 0
     micro_scalp = {
-        "pnl_pct_total": round(ms_row["pnl_pct_total"] or 0.0, 4),
-        "pnl_pct_avg": round(ms_row["pnl_pct_avg"] or 0.0, 4),
-        "closed": ms_closed,
-        "open": ms_row["open_count"] or 0,
-        "wins": ms_wins,
-        "losses": ms_losses,
-        "winrate_pct": round(ms_wins / (ms_wins + ms_losses) * 100, 2) if (ms_wins + ms_losses) else 0.0,
+        "pnl_pct_total":  round(ms_row["pnl_pct_total"]  or 0.0, 4),
+        "pnl_pct_avg":    round(ms_row["pnl_pct_avg"]    or 0.0, 4),
+        "pnl_usdt":       round(ms_row["pnl_usdt_total"] or 0.0, 4),
+        "closed":         ms_closed,
+        "open":           ms_row["open_count"] or 0,
+        "wins":           ms_wins,
+        "losses":         ms_losses,
+        "winrate_pct":    round(ms_wins / (ms_wins + ms_losses) * 100, 2) if (ms_wins + ms_losses) else 0.0,
     }
 
     return {"futures": futures, "spot": spot, "micro_scalp": micro_scalp}

@@ -180,6 +180,7 @@ class MLPredictor:
             rec.setdefault("warnings", []).append(
                 f"ML: prob(TP1)={prob_str} — setup filtrado (umbral {threshold:.2f})"
             )
+            result["ml_filtered"] = True
             logger.debug("ML FILTER %s: prob=%s < %.2f → WAIT", result.get("symbol"), prob_str, low_threshold)
 
         elif prob < threshold:

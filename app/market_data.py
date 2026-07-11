@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -5,6 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from app.config import BINANCE_FUTURES_BASE_URL
+
+logger = logging.getLogger("market_data")
 
 _SPOT_BASE = "https://api.binance.com"
 _FUTURES_BASE = BINANCE_FUTURES_BASE_URL
@@ -19,8 +22,13 @@ _cache_lock = threading.Lock()
 
 def _get_session() -> requests.Session:
     if not hasattr(_thread_local, "session"):
+        from requests.adapters import HTTPAdapter
         s = requests.Session()
         s.headers["User-Agent"] = "crypto-dashboard/2.0"
+        # Sin reintentos — falla rápido en 10s en vez de 40s (4 intentos × 10s)
+        _no_retry = HTTPAdapter(max_retries=0)
+        s.mount("https://", _no_retry)
+        s.mount("http://",  _no_retry)
         _thread_local.session = s
     return _thread_local.session
 
@@ -47,13 +55,20 @@ def _fetch(url: str, params: Optional[Dict] = None, ttl: float = 10.0) -> Option
     cached = _cache_get(key)
     if cached is not None:
         return cached
+    t0 = time.monotonic()
     try:
         resp = _get_session().get(url, params=params or {}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         _cache_set(key, data, ttl)
         return data
-    except Exception:
+    except Exception as exc:
+        # Diagnóstico temporal: confirmar si los ~10s por símbolo son timeouts
+        # reales en vez de respuestas lentas legítimas. Ver HANDOFF.md.
+        logger.warning(
+            "FETCH FAIL %.2fs %s params=%s | %s: %s",
+            time.monotonic() - t0, url, params, type(exc).__name__, exc,
+        )
         return None
 
 
@@ -151,9 +166,10 @@ def get_klines(
 
 
 def get_agg_trades_raw(symbol: str, limit: int = 100) -> List[Dict]:
-    """AggTrades crudos del endpoint REST spot (campo 'a' = aggTradeId). TTL 5s."""
+    """AggTrades crudos del endpoint de futuros (campo 'a' = aggTradeId). TTL 5s.
+    Usa /fapi/v1/aggTrades — todos los símbolos del scanner son perps, no spot."""
     data = _fetch(
-        f"{_SPOT_BASE}/api/v3/aggTrades",
+        f"{_FUTURES_BASE}/fapi/v1/aggTrades",
         params={"symbol": symbol.upper(), "limit": limit},
         ttl=5.0,
     )

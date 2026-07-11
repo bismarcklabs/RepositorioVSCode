@@ -21,6 +21,15 @@ _configured = False
 _listener: logging.handlers.QueueListener | None = None
 
 
+class _SafeRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    """RotatingFileHandler que ignora WinError 32 cuando otro proceso tiene el archivo abierto."""
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+        except PermissionError:
+            pass  # otro proceso (ej. dashboard) tiene app.log abierto → saltar rotación
+
+
 class _NamespaceFilter(logging.Filter):
     def __init__(self, prefixes: list):
         super().__init__()
@@ -54,20 +63,20 @@ def setup_logging(log_dir: str = "logs") -> None:
         root.addHandler(sh)
 
     # ── File handlers (solo los usa el QueueListener, no el root) ─────────
-    app_h = logging.handlers.RotatingFileHandler(
+    app_h = _SafeRotatingFileHandler(
         f"{log_dir}/app.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
     )
     app_h.setLevel(logging.INFO)
     app_h.setFormatter(fmt)
 
-    alerts_h = logging.handlers.RotatingFileHandler(
+    alerts_h = _SafeRotatingFileHandler(
         f"{log_dir}/alerts.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8"
     )
     alerts_h.setLevel(logging.INFO)
     alerts_h.setFormatter(fmt)
     alerts_h.addFilter(_NamespaceFilter(["dashboard", "app.notifications", "outcome_tracker"]))
 
-    db_h = logging.handlers.RotatingFileHandler(
+    db_h = _SafeRotatingFileHandler(
         f"{log_dir}/database.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     db_h.setLevel(logging.INFO)

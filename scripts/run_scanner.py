@@ -64,6 +64,11 @@ from app.config import (
     ACCUMULATION_SCAN_INTERVAL_HOURS,
     ACCUMULATION_ANCHOR_TIMES_UTC,
     ACCUMULATION_WATCHLIST_MAX_SIZE,
+    SHORT_FUTURES_BLACKOUT_HOURS,
+    LONG_FUTURES_BLACKOUT_HOURS,
+    BUY_SPOT_BLACKOUT_HOURS,
+    MICRO_SCALP_BLACKOUT_HOURS_LONG,
+    MICRO_SCALP_BLACKOUT_HOURS_SHORT,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -102,6 +107,12 @@ from app.trend_continuation import (
     calculate_trend_priority_score,
 )
 from app.accumulation_scanner import run_accumulation_scan, check_ignition_trigger
+
+# Pool interno persistente: 6 workers externos × 11 llamadas = 66 tareas simultáneas.
+# Al ser módulo-nivel, los threads (y sus requests.Session thread-local) sobreviven
+# entre ciclos. Tras el primer ciclo las conexiones TLS ya están establecidas →
+# llamadas REST pasan de ~10s (TLS desde cero) a <0.5s (keep-alive).
+_INNER_EXECUTOR = ThreadPoolExecutor(max_workers=66)
 
 _GEX_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
 
@@ -257,11 +268,23 @@ def _init_cooldown_from_db() -> None:
         logger.exception("Error al inicializar cooldown desde DB")
 
 
+_BLACKOUT_BY_ACTION: dict = {
+    "SHORT_FUTURES": SHORT_FUTURES_BLACKOUT_HOURS,
+    "LONG_FUTURES":  LONG_FUTURES_BLACKOUT_HOURS,
+    "BUY_SPOT":      BUY_SPOT_BLACKOUT_HOURS,
+}
+
+
 def _should_send_alert(symbol: str, action: str, score: int, confidence: int) -> bool:
-    """Devuelve True si la alerta debe enviarse (score umbral + cooldown)."""
+    """Devuelve True si la alerta debe enviarse (score umbral + blackout horario + cooldown)."""
     min_score = _MIN_SCORE_BY_ACTION.get(action, 999)
     if score < min_score:
         logger.debug("SKIP %s %s — score %d < umbral %d", symbol, action, score, min_score)
+        return False
+    utc_hour = time.gmtime().tm_hour
+    blackout_hours = _BLACKOUT_BY_ACTION.get(action, frozenset())
+    if utc_hour in blackout_hours:
+        logger.debug("BLACKOUT %s %s — hora UTC=%dh bloqueada (WR adj histórico bajo)", symbol, action, utc_hour)
         return False
     key = f"{symbol}:{action}"
     entry = _cooldown.get(key)
@@ -351,6 +374,13 @@ def _process_alert(result: Dict[str, Any]) -> None:
             logger.exception("Error en auto_evaluate para %s", symbol)
 
 
+def _timed_call(fn, *args, **kwargs) -> Tuple[Any, float]:
+    """Ejecuta fn y devuelve (resultado, segundos). Propaga excepciones sin envolver."""
+    t0 = time.monotonic()
+    result = fn(*args, **kwargs)
+    return result, time.monotonic() - t0
+
+
 def _scan_symbol(symbol: str, candidate: Dict[str, Any],
                  market_regime: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     t0 = time.monotonic()
@@ -370,32 +400,42 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             ]
 
         t_api_start = time.monotonic()
-        with ThreadPoolExecutor(max_workers=11) as ex:
-            f_funding       = ex.submit(market_data.get_funding, symbol)
-            f_oi            = ex.submit(market_data.get_open_interest, symbol)
-            f_ob_spot       = ex.submit(get_orderbook_imbalance, symbol, 20, "spot")
-            f_ob_fut        = ex.submit(get_orderbook_imbalance, symbol, 20, "futures")
-            f_technical     = ex.submit(get_technical_context, symbol)
-            f_vp            = ex.submit(get_volume_profile, symbol)
-            f_fp            = ex.submit(get_footprint, symbol)
-            f_futures_price = ex.submit(market_data.get_futures_price, symbol)
-            f_spot_price    = ex.submit(market_data.get_spot_price, symbol)
-            f_multi_ex      = ex.submit(get_multi_exchange_snapshot, symbol)
-            f_klines_1m     = ex.submit(market_data.get_klines, symbol, "1m", 50)
+        f_funding       = _INNER_EXECUTOR.submit(_timed_call, market_data.get_funding, symbol)
+        f_oi            = _INNER_EXECUTOR.submit(_timed_call, market_data.get_open_interest, symbol)
+        f_ob_spot       = _INNER_EXECUTOR.submit(_timed_call, get_orderbook_imbalance, symbol, 20, "spot")
+        f_ob_fut        = _INNER_EXECUTOR.submit(_timed_call, get_orderbook_imbalance, symbol, 20, "futures")
+        f_technical     = _INNER_EXECUTOR.submit(_timed_call, get_technical_context, symbol)
+        f_vp            = _INNER_EXECUTOR.submit(_timed_call, get_volume_profile, symbol)
+        f_fp            = _INNER_EXECUTOR.submit(_timed_call, get_footprint, symbol)
+        f_futures_price = _INNER_EXECUTOR.submit(_timed_call, market_data.get_futures_price, symbol)
+        f_spot_price    = _INNER_EXECUTOR.submit(_timed_call, market_data.get_spot_price, symbol)
+        f_multi_ex      = _INNER_EXECUTOR.submit(_timed_call, get_multi_exchange_snapshot, symbol)
+        f_klines_1m     = _INNER_EXECUTOR.submit(_timed_call, market_data.get_klines, symbol, "1m", 50)
 
-        funding           = f_funding.result()
-        oi                = f_oi.result()
-        ob_spot           = f_ob_spot.result()
-        ob_futures        = f_ob_fut.result()
-        technical         = f_technical.result()
-        vp                = f_vp.result()
-        fp                = f_fp.result()
-        futures_price_raw = f_futures_price.result()
-        price             = f_spot_price.result()
-        multi_ex          = f_multi_ex.result()
-        klines_1m         = f_klines_1m.result()
+        funding,           t_funding       = f_funding.result()
+        oi,                t_oi            = f_oi.result()
+        ob_spot,           t_ob_spot       = f_ob_spot.result()
+        ob_futures,        t_ob_fut        = f_ob_fut.result()
+        technical,         t_technical     = f_technical.result()
+        vp,                t_vp            = f_vp.result()
+        fp,                t_fp            = f_fp.result()
+        futures_price_raw, t_futures_price = f_futures_price.result()
+        price,             t_spot_price    = f_spot_price.result()
+        multi_ex,          t_multi_ex      = f_multi_ex.result()
+        klines_1m,         t_klines_1m     = f_klines_1m.result()
         orderbook_data   = ob_futures if ob_futures.get("orderbook_available") else ob_spot
         t_api = time.monotonic() - t_api_start
+
+        # Diagnóstico temporal: ¿cuál de las 11 sub-llamadas domina t_api?
+        # Quitar una vez identificado el cuello de botella (ver HANDOFF.md).
+        logger.info(
+            "TIMING BREAKDOWN %-12s | funding=%.2fs oi=%.2fs ob_spot=%.2fs ob_fut=%.2fs "
+            "tech=%.2fs vp=%.2fs fp=%.2fs fut_price=%.2fs spot_price=%.2fs "
+            "multi_ex=%.2fs klines1m=%.2fs",
+            symbol, t_funding, t_oi, t_ob_spot, t_ob_fut,
+            t_technical, t_vp, t_fp, t_futures_price, t_spot_price,
+            t_multi_ex, t_klines_1m,
+        )
 
         gex: Optional[Dict] = None
         if symbol in _GEX_SYMBOLS:
@@ -750,13 +790,7 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
 
     t0 = time.monotonic()
     micro_sent = 0
-    # Blackout horario: 20:00 UTC — 0% WR histórico en micro-scalp (-18% PnL total).
-    # Coincide con el cierre de commodities/metales en NY → whipsaws artificiales.
-    # El score sigue calculándose (para snapshots y observación), solo se bloquea el envío.
     _utc_hour = time.gmtime().tm_hour
-    _micro_blackout = _utc_hour == 20
-    if _micro_blackout:
-        logger.debug("MICRO BLACKOUT activo: hora UTC=%d (20h bloqueada)", _utc_hour)
 
     micro_actionable = [
         r.get("micro_scalp") for r in results
@@ -765,7 +799,10 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
     for alert in micro_actionable:
         action = alert.get("action", "")
         symbol = alert.get("symbol", "")
-        if _micro_blackout:
+        if action == "MICRO_LONG_SCALP"  and _utc_hour in MICRO_SCALP_BLACKOUT_HOURS_LONG:
+            logger.debug("MICRO BLACKOUT %-12s | %s | hora=%dh UTC bloqueada", symbol, action, _utc_hour)
+            continue
+        if action == "MICRO_SHORT_SCALP" and _utc_hour in MICRO_SCALP_BLACKOUT_HOURS_SHORT:
             logger.debug("MICRO BLACKOUT %-12s | %s | hora=%dh UTC bloqueada", symbol, action, _utc_hour)
             continue
         if not _should_send_micro_alert(symbol, action):

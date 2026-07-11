@@ -36,6 +36,27 @@ MIN_ALERT_SCORE_SHORT_FUTURES = int(os.getenv("MIN_ALERT_SCORE_SHORT_FUTURES", "
 EXTREME_FUNDING_ABS = float(os.getenv("EXTREME_FUNDING_ABS", "0.001"))
 NEAR_MISS_THRESHOLD = int(os.getenv("NEAR_MISS_THRESHOLD", "55"))
 
+
+def _parse_hour_set(env_key: str, default: str = "") -> frozenset:
+    """Parsea una lista de horas UTC separadas por coma desde una variable de entorno."""
+    val = os.getenv(env_key, default)
+    if not val.strip():
+        return frozenset()
+    return frozenset(int(h.strip()) for h in val.split(",") if h.strip().isdigit())
+
+# ── Blackout horario por tipo de operación (UTC) ──────────────────────────
+# Horas derivadas del análisis de WR ajustado post-calibración (26 días, n≥5/hora).
+# SHORT: bloques 09-12h y 23h tienen WR adj < 43% → mercado alcista sesión Europa.
+# LONG: 20h y 22h presentan WR adj < 44% → posiblemente reversión final de sesión US.
+# BUY_SPOT: 02h y 06h con < 31% → illiquidez nocturna asiática extrema.
+# Micro-scalp LONG: 01h, 18h, 22h con WR < 31% y PnL negativo.
+# Micro-scalp SHORT: 07h y 20h con WR < 30% (20h: 11% WR, -1.34% PnL histórico).
+SHORT_FUTURES_BLACKOUT_HOURS     = _parse_hour_set("SHORT_FUTURES_BLACKOUT_HOURS",     "6,9,10,11,12,23")
+LONG_FUTURES_BLACKOUT_HOURS      = _parse_hour_set("LONG_FUTURES_BLACKOUT_HOURS",      "20,22")
+BUY_SPOT_BLACKOUT_HOURS          = _parse_hour_set("BUY_SPOT_BLACKOUT_HOURS",          "2,6")
+MICRO_SCALP_BLACKOUT_HOURS_LONG  = _parse_hour_set("MICRO_SCALP_BLACKOUT_HOURS_LONG",  "1,18,22")
+MICRO_SCALP_BLACKOUT_HOURS_SHORT = _parse_hour_set("MICRO_SCALP_BLACKOUT_HOURS_SHORT", "7,20")
+
 # ── Feature flags ──────────────────────────────────────────────────────────
 ENABLE_LIQUIDATIONS = os.getenv("ENABLE_LIQUIDATIONS", "true").lower() == "true"
 
@@ -187,6 +208,8 @@ MICRO_SCALP_MAX_SPREAD_PCT = float(os.getenv("MICRO_SCALP_MAX_SPREAD_PCT", "0.06
 MICRO_SCALP_TIMEOUT_MINUTES = int(os.getenv("MICRO_SCALP_TIMEOUT_MINUTES", "10"))
 MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES = int(os.getenv("MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES", "60"))
 MICRO_SCALP_ALERT_COOLDOWN_SECONDS = int(os.getenv("MICRO_SCALP_ALERT_COOLDOWN_SECONDS", "180"))
+MICRO_SCALP_CAPITAL_USDT    = float(os.getenv("MICRO_SCALP_CAPITAL_USDT",    "250"))
+MICRO_SCALP_TRADE_SIZE_USDT = float(os.getenv("MICRO_SCALP_TRADE_SIZE_USDT", "25"))
 
 # ── Regimen global BTC (filtro direccional de mercado) ────────────────────
 BTC_REGIME_ENABLED = os.getenv("BTC_REGIME_ENABLED", "true").lower() == "true"
