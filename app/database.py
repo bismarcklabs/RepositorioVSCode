@@ -10,13 +10,13 @@ Diseño:
 import calendar
 import json
 import logging
-import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.config import DATABASE_PATH, SNAPSHOT_RETENTION_DAYS, SNAPSHOT_MIN_SCORE
+from app.db import USE_POSTGRESQL, connect as _db_connect, apply_migrations as _db_apply_migrations, _now_iso, _iso_to_ts, _ts_to_iso
 
 logger = logging.getLogger("database")
 
@@ -25,25 +25,14 @@ _init_lock = threading.Lock()
 _db_initialized = False
 
 
-# ── Conexión ──────────────────────────────────────────────────────────────
+# ── Conexión (SQLite por default, PostgreSQL si USE_POSTGRESQL=true) ──────
 
-def _get_conn() -> sqlite3.Connection:
+def _get_conn():
     if not hasattr(_db_local, "conn") or _db_local.conn is None:
-        db_path = Path(DATABASE_PATH)
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        # timeout=30 → Python espera hasta 30s por el lock antes de lanzar OperationalError
-        conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        # busy_timeout=30000ms → SQLite espera 30s a nivel de motor (refuerza el timeout de Python)
-        conn.execute("PRAGMA busy_timeout=30000;")
-        # Checkpoint automático cada 200 páginas — evita que el WAL file crezca indefinidamente
-        conn.execute("PRAGMA wal_autocheckpoint=200;")
-        # Cache de 32MB por conexión — reduce I/O en lecturas repetidas del dashboard
-        conn.execute("PRAGMA cache_size=-32000;")
-        _db_local.conn = conn
+        # SQLite recibe la ruta explícita desde el atributo del módulo para que
+        # los tests puedan redirigirla con monkeypatch (app/db/sqlite.py congela
+        # su copia de DATABASE_PATH al importarse).
+        _db_local.conn = _db_connect() if USE_POSTGRESQL else _db_connect(DATABASE_PATH)
     return _db_local.conn
 
 
@@ -53,7 +42,9 @@ def _migrate_schema() -> None:
     """Agrega columnas nuevas a tablas existentes de forma idempotente.
 
     SQLite no soporta ALTER TABLE ... ADD COLUMN IF NOT EXISTS, así que
-    intentamos cada ALTER y silenciamos el error de columna duplicada.
+    consultamos las columnas existentes con PRAGMA table_info (una vez por
+    tabla) y solo ejecutamos los ALTER de columnas faltantes — típicamente
+    ninguno después del primer arranque.
     """
     conn = _get_conn()
     new_columns = [
@@ -126,13 +117,23 @@ def _migrate_schema() -> None:
         ("auto_positions", "exchange",          "TEXT NOT NULL DEFAULT 'paper'"),
         ("auto_positions", "exchange_order_id", "TEXT"),
     ]
+    existing: Dict[str, set] = {}
+    for table in {t for t, _, _ in new_columns}:
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            existing[table] = {r["name"] for r in rows}
+        except Exception:
+            existing[table] = set()
+
     for table, col, col_def in new_columns:
+        if col in existing[table]:
+            continue
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
             conn.commit()
             logger.info("Columna agregada: %s.%s", table, col)
         except Exception:
-            pass  # ya existe
+            pass  # red de seguridad (carrera entre procesos)
 
 
 def init_db() -> None:
@@ -142,358 +143,14 @@ def init_db() -> None:
             return
         try:
             conn = _get_conn()
-            conn.executescript("""
-                CREATE TABLE IF NOT EXISTS market_snapshots (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    symbol          TEXT    NOT NULL,
-                    price           REAL,
-                    futures_price   REAL,
-                    action          TEXT,
-                    market          TEXT,
-                    confidence      INTEGER,
-                    score           INTEGER,
-                    signal          TEXT,
-                    risk_level      TEXT,
-
-                    delta           REAL,
-                    cvd             REAL,
-                    buy_volume      REAL,
-                    sell_volume     REAL,
-                    funding         REAL,
-                    open_interest   REAL,
-                    imbalance       REAL,
-                    spread_pct      REAL,
-
-                    return_3m       REAL,
-                    return_5m       REAL,
-                    return_15m      REAL,
-                    return_1h       REAL,
-                    vwap            REAL,
-                    vwap_distance_pct REAL,
-                    above_vwap      INTEGER,
-                    relative_volume REAL,
-                    trend_bias      TEXT,
-
-                    poc             REAL,
-                    nearest_vp_level REAL,
-                    nearest_vp_type  TEXT,
-                    vp_distance     REAL,
-
-                    footprint_delta      REAL,
-                    absorption_buy       INTEGER,
-                    absorption_sell      INTEGER,
-                    stacked_buy_imbalance  INTEGER,
-                    stacked_sell_imbalance INTEGER,
-
-                    gex_available   INTEGER,
-                    gex_score       INTEGER,
-                    call_wall       REAL,
-                    put_wall        REAL,
-                    gamma_flip      REAL,
-
-                    entry           REAL,
-                    entry_zone_low  REAL,
-                    entry_zone_high REAL,
-                    stop_loss       REAL,
-                    take_profit_1   REAL,
-                    take_profit_2   REAL,
-                    risk_reward_1   REAL,
-                    risk_reward_2   REAL,
-
-                    reasons_json    TEXT,
-                    warnings_json   TEXT,
-                    invalidation_json TEXT
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_snapshots_sym_ts
-                    ON market_snapshots(symbol, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_snapshots_ts
-                    ON market_snapshots(timestamp);
-
-                CREATE TABLE IF NOT EXISTS trade_alerts (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    symbol          TEXT    NOT NULL,
-                    action          TEXT    NOT NULL,
-                    market          TEXT    NOT NULL,
-                    confidence      INTEGER,
-                    score           INTEGER,
-                    price           REAL,
-                    entry           REAL,
-                    stop_loss       REAL,
-                    take_profit_1   REAL,
-                    take_profit_2   REAL,
-                    risk_reward_1   REAL,
-                    risk_reward_2   REAL,
-                    status          TEXT    DEFAULT 'open'
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_alerts_sym_ts
-                    ON trade_alerts(symbol, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_alerts_status
-                    ON trade_alerts(status);
-
-                CREATE TABLE IF NOT EXISTS notification_log (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    alert_id        INTEGER REFERENCES trade_alerts(id),
-                    symbol          TEXT    NOT NULL,
-                    action          TEXT    NOT NULL,
-                    channel         TEXT    NOT NULL,
-                    ok              INTEGER NOT NULL,
-                    error           TEXT    DEFAULT '',
-                    cooldown_skipped INTEGER DEFAULT 0
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_notif_alert_id
-                    ON notification_log(alert_id);
-
-                CREATE TABLE IF NOT EXISTS alert_outcomes (
-                    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                    alert_id                INTEGER NOT NULL REFERENCES trade_alerts(id),
-                    checked_at              TEXT    NOT NULL,
-                    horizon_minutes         INTEGER NOT NULL,
-                    price_at_check          REAL,
-                    future_return_pct       REAL,
-                    max_favorable_excursion REAL,
-                    max_adverse_excursion   REAL,
-                    hit_tp1                 INTEGER DEFAULT 0,
-                    hit_tp2                 INTEGER DEFAULT 0,
-                    hit_stop                INTEGER DEFAULT 0,
-                    outcome                 TEXT    DEFAULT 'unknown',
-                    UNIQUE(alert_id, horizon_minutes)
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_outcomes_alert_id
-                    ON alert_outcomes(alert_id);
-
-                CREATE TABLE IF NOT EXISTS auto_positions (
-                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                    alert_id          INTEGER REFERENCES trade_alerts(id),
-                    symbol            TEXT    NOT NULL,
-                    action            TEXT    NOT NULL,
-                    mode              TEXT    NOT NULL DEFAULT 'paper',
-                    exchange          TEXT    NOT NULL DEFAULT 'paper',
-                    exchange_order_id TEXT,
-                    open_time         TEXT    NOT NULL,
-                    close_time        TEXT,
-                    entry_price       REAL    NOT NULL,
-                    size_usdt         REAL    NOT NULL,
-                    leverage          INTEGER NOT NULL DEFAULT 1,
-                    tp1               REAL,
-                    tp2               REAL,
-                    sl                REAL    NOT NULL,
-                    sl_current        REAL    NOT NULL,
-                    status            TEXT    NOT NULL DEFAULT 'open',
-                    tp1_hit           INTEGER NOT NULL DEFAULT 0,
-                    tp1_pnl_usdt      REAL    NOT NULL DEFAULT 0.0,
-                    close_reason      TEXT,
-                    exit_price        REAL,
-                    final_pnl_usdt    REAL,
-                    total_pnl_usdt    REAL,
-                    total_pnl_pct     REAL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_autopos_status
-                    ON auto_positions(status);
-                CREATE INDEX IF NOT EXISTS idx_autopos_symbol
-                    ON auto_positions(symbol, status);
-
-                -- Ticker por exchange externo (Coinbase, Kraken) por ciclo
-                CREATE TABLE IF NOT EXISTS exchange_market_snapshots (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    symbol          TEXT    NOT NULL,           -- normalizado: "BTC"
-                    binance_symbol  TEXT    NOT NULL,           -- "BTCUSDT"
-                    exchange        TEXT    NOT NULL,           -- "coinbase" | "kraken"
-                    exchange_symbol TEXT    NOT NULL DEFAULT '', -- "BTC-USD" | "XBT/USD"
-                    price           REAL,
-                    bid             REAL,
-                    ask             REAL,
-                    spread_pct      REAL,
-                    volume_24h      REAL,
-                    ok              INTEGER DEFAULT 1,
-                    error           TEXT    DEFAULT ''
-                );
-                CREATE INDEX IF NOT EXISTS idx_exsnap_sym_ts
-                    ON exchange_market_snapshots(binance_symbol, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_exsnap_ts
-                    ON exchange_market_snapshots(timestamp);
-
-                -- Métricas agregadas por símbolo soportado por ciclo
-                CREATE TABLE IF NOT EXISTS multi_exchange_metrics (
-                    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp                   TEXT    NOT NULL,
-                    symbol                      TEXT    NOT NULL,
-                    binance_symbol              TEXT    NOT NULL,
-                    binance_price               REAL,
-                    coinbase_price              REAL,
-                    kraken_price                REAL,
-                    price_deviation_pct         REAL,
-                    exchange_availability_score REAL,
-                    multi_exchange_confidence   REAL,
-                    multi_exchange_score        INTEGER DEFAULT 0,
-                    warnings_json               TEXT    DEFAULT '[]'
-                );
-                CREATE INDEX IF NOT EXISTS idx_mexmetrics_sym_ts
-                    ON multi_exchange_metrics(binance_symbol, timestamp);
-
-                CREATE TABLE IF NOT EXISTS micro_scalp_alerts (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    symbol          TEXT    NOT NULL,
-                    action          TEXT    NOT NULL,
-                    score           INTEGER NOT NULL,
-                    confidence      INTEGER DEFAULT 0,
-                    entry           REAL,
-                    take_profit_1   REAL,
-                    take_profit_2   REAL,
-                    stop_loss       REAL,
-                    timeout_minutes INTEGER DEFAULT 10,
-                    return_3m       REAL DEFAULT 0,
-                    return_5m       REAL DEFAULT 0,
-                    relative_volume REAL DEFAULT 1,
-                    delta           REAL DEFAULT 0,
-                    cvd_15m         REAL DEFAULT 0,
-                    footprint_delta REAL DEFAULT 0,
-                    imbalance       REAL DEFAULT 0,
-                    oi_change_pct   REAL DEFAULT 0,
-                    funding         REAL DEFAULT 0,
-                    status          TEXT DEFAULT 'open',
-                    close_time      TEXT,
-                    exit_price      REAL,
-                    outcome         TEXT DEFAULT 'open',
-                    hit_tp1         INTEGER DEFAULT 0,
-                    hit_tp2         INTEGER DEFAULT 0,
-                    hit_stop        INTEGER DEFAULT 0,
-                    pnl_pct         REAL DEFAULT 0,
-                    max_favorable_pct REAL DEFAULT 0,
-                    max_adverse_pct REAL DEFAULT 0,
-                    reasons_json    TEXT DEFAULT '[]',
-                    warnings_json   TEXT DEFAULT '[]'
-                );
-                CREATE INDEX IF NOT EXISTS idx_micro_scalp_sym_ts
-                    ON micro_scalp_alerts(symbol, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_micro_scalp_status
-                    ON micro_scalp_alerts(status);
-
-                CREATE TABLE IF NOT EXISTS micro_notification_log (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp       TEXT    NOT NULL,
-                    micro_alert_id  INTEGER REFERENCES micro_scalp_alerts(id),
-                    symbol          TEXT    NOT NULL,
-                    action          TEXT    NOT NULL,
-                    channel         TEXT    NOT NULL,
-                    ok              INTEGER NOT NULL,
-                    error           TEXT DEFAULT ''
-                );
-                CREATE INDEX IF NOT EXISTS idx_micro_notif_alert_id
-                    ON micro_notification_log(micro_alert_id);
-
-                CREATE TABLE IF NOT EXISTS news_events (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id        TEXT NOT NULL UNIQUE,
-                    symbol          TEXT NOT NULL,
-                    source          TEXT NOT NULL,
-                    source_domain   TEXT DEFAULT '',
-                    title           TEXT NOT NULL,
-                    summary         TEXT DEFAULT '',
-                    url             TEXT DEFAULT '',
-                    published_at    TEXT NOT NULL,
-                    collected_at    TEXT NOT NULL,
-                    event_type      TEXT DEFAULT 'general',
-                    sentiment_score REAL DEFAULT 0,
-                    weighted_score  REAL DEFAULT 0,
-                    prediction      TEXT DEFAULT 'NEUTRAL',
-                    credibility     REAL DEFAULT 0,
-                    event_types_json TEXT DEFAULT '[]'
-                );
-                CREATE INDEX IF NOT EXISTS idx_news_events_sym_ts
-                    ON news_events(symbol, published_at);
-
-                CREATE TABLE IF NOT EXISTS news_predictions (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp           TEXT NOT NULL,
-                    symbol              TEXT NOT NULL,
-                    prediction          TEXT NOT NULL,
-                    sentiment_score     REAL DEFAULT 0,
-                    confidence          INTEGER DEFAULT 0,
-                    news_count          INTEGER DEFAULT 0,
-                    positive_count      INTEGER DEFAULT 0,
-                    negative_count      INTEGER DEFAULT 0,
-                    contradictory       INTEGER DEFAULT 0,
-                    top_events_json     TEXT DEFAULT '[]',
-                    price_at_prediction REAL,
-                    horizon_minutes     INTEGER DEFAULT 60,
-                    evaluated_at        TEXT,
-                    price_at_outcome    REAL,
-                    return_pct          REAL,
-                    outcome             TEXT DEFAULT 'open'
-                );
-                CREATE INDEX IF NOT EXISTS idx_news_predictions_status
-                    ON news_predictions(outcome, timestamp);
-                CREATE INDEX IF NOT EXISTS idx_news_predictions_sym_ts
-                    ON news_predictions(symbol, timestamp);
-
-                CREATE TABLE IF NOT EXISTS security_event_alerts (
-                    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fingerprint           TEXT NOT NULL UNIQUE,
-                    created_at            TEXT NOT NULL,
-                    updated_at            TEXT NOT NULL,
-                    symbol                TEXT NOT NULL,
-                    severity              TEXT NOT NULL,
-                    confirmation_status   TEXT NOT NULL,
-                    security_score        REAL DEFAULT 0,
-                    source_count          INTEGER DEFAULT 0,
-                    official_source_count INTEGER DEFAULT 0,
-                    first_published_at    TEXT,
-                    title                 TEXT NOT NULL,
-                    analysis_json         TEXT DEFAULT '{}',
-                    last_notified_at      TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_security_alerts_sym_ts
-                    ON security_event_alerts(symbol, created_at);
-
-                -- Accumulation Watch: tokens fuera del top-50 por volumen en fase
-                -- de "coiling" (contracción de volatilidad + acumulación), candidatos
-                -- a "ignición" (breakout tipo FOMO).
-                CREATE TABLE IF NOT EXISTS accumulation_watch (
-                    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                    symbol              TEXT    NOT NULL UNIQUE,
-                    first_seen          TEXT    NOT NULL,
-                    last_scan           TEXT    NOT NULL,
-                    coiling_score       REAL    DEFAULT 0,
-                    contraction_ratio   REAL    DEFAULT 0,
-                    position_in_range   REAL    DEFAULT 0,
-                    above_sma50         INTEGER DEFAULT 0,
-                    vol_ratio_7_30      REAL    DEFAULT 0,
-                    quote_volume        REAL    DEFAULT 0,
-                    funding_at_watch    REAL    DEFAULT 0,
-                    price_at_watch      REAL    DEFAULT 0,
-                    status              TEXT    DEFAULT 'watching',
-                    ignited_at          TEXT,
-                    ignition_reason     TEXT    DEFAULT ''
-                );
-                CREATE INDEX IF NOT EXISTS idx_accum_watch_status
-                    ON accumulation_watch(status);
-                CREATE INDEX IF NOT EXISTS idx_accum_watch_score
-                    ON accumulation_watch(coiling_score);
-                CREATE TABLE IF NOT EXISTS historical_klines (
-                    symbol     TEXT    NOT NULL,
-                    interval   TEXT    NOT NULL,
-                    open_time  INTEGER NOT NULL,
-                    open       REAL    NOT NULL,
-                    high       REAL    NOT NULL,
-                    low        REAL    NOT NULL,
-                    close      REAL    NOT NULL,
-                    volume     REAL    NOT NULL,
-                    PRIMARY KEY (symbol, interval, open_time)
-                );
-                CREATE INDEX IF NOT EXISTS idx_hk_symbol_interval
-                    ON historical_klines(symbol, interval);
-            """)
-            conn.commit()
+            # El esquema completo vive en migrations/{sqlite,postgres}/*.sql.
+            # Cambios futuros de esquema van como nuevos archivos 00N_*.sql,
+            # ya no en DDL inline ni en la lista new_columns.
+            _db_apply_migrations(conn)
+            # Red de seguridad para DBs creadas antes de que 001_initial.sql
+            # tuviera todas las columnas (CREATE TABLE IF NOT EXISTS no agrega
+            # columnas a tablas existentes). Retirar en 1-2 releases si sigue
+            # ejecutando 0 ALTERs.
             _migrate_schema()
             _db_initialized = True
             logger.info("Base de datos inicializada: %s", DATABASE_PATH)
@@ -502,6 +159,32 @@ def init_db() -> None:
 
 
 # ── Snapshots ─────────────────────────────────────────────────────────────
+
+def _compact_structure(structure: Optional[Dict[str, Any]]) -> str:
+    """Serializa la estructura chartista acotada para structure_json (~1 KB máx).
+
+    Conserva lo que el dashboard necesita (niveles top, S/R más cercanos,
+    breakout, patrones, rango) y descarta metadatos internos de los niveles.
+    """
+    if not structure:
+        return "{}"
+    try:
+        levels = [
+            {"price": lv.get("price"), "touches": lv.get("touches"), "strength": lv.get("strength")}
+            for lv in (structure.get("levels") or [])[:6]
+        ]
+        compact = {
+            "levels": levels,
+            "nearest_support": structure.get("nearest_support"),
+            "nearest_resistance": structure.get("nearest_resistance"),
+            "breakout": structure.get("breakout"),
+            "patterns": structure.get("patterns") or [],
+            "range": structure.get("range"),
+        }
+        return json.dumps(compact)
+    except Exception:
+        return "{}"
+
 
 def _snapshot_row(data: Dict[str, Any]) -> Tuple:
     """Extrae una tupla ordenada para insertar en market_snapshots."""
@@ -592,9 +275,10 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
         sd.get("futures_score", 0),
         sd.get("risk_penalty", 0),
         rec.get("confluence_score", 0),
-        # contexto completo
+        # contexto completo (signal_json ya no se persiste: su único consumidor
+        # era signal_description en main.py, que nunca se renderiza)
         json.dumps(rec),
-        json.dumps(data.get("signal") or {}),
+        "{}",
         json.dumps(data.get("alert_report") or {}),
         # multi-exchange
         sd.get("multi_exchange_score", 0),
@@ -614,6 +298,11 @@ def _snapshot_row(data: Dict[str, Any]) -> Tuple:
         int(bool(data.get("momentum_continuation", False))),
         data.get("momentum_persistence_count", 0),
         (data.get("setup_evaluation") or rec.get("setup_evaluation") or {}).get("setup_route") or "",
+        # estructura chartista 3m (panel de setups del dashboard)
+        _compact_structure(data.get("structure_micro")),
+        # backfill de downtime: 1 si la fila viene de snapshot_backfill.py
+        # (precio de klines + delta aproximado), no de un ciclo real
+        int(bool(data.get("is_backfilled", False))),
     )
 
 
@@ -641,7 +330,8 @@ _SNAPSHOT_INSERT = """
         setup_valid, setup_grade, setup_score, trigger_type,
         ml_probability, ml_filtered,
         trend_priority_score, momentum_continuation,
-        momentum_persistence_count, setup_route
+        momentum_persistence_count, setup_route,
+        structure_json, is_backfilled
     ) VALUES (
         ?,?,?,?,?,?,?,?,?,?,
         ?,?,?,?,?,?,?,?,
@@ -656,20 +346,38 @@ _SNAPSHOT_INSERT = """
         ?,?,?,
         ?,?,?,?,
         ?,?,?,?,?,?,
-        ?,?,?,?
+        ?,?,?,?,
+        ?,?
     )
 """
 
 
-def insert_snapshots_batch(records: List[Dict[str, Any]]) -> None:
-    """Inserta snapshots del ciclo — solo los que superen SNAPSHOT_MIN_SCORE.
+def insert_snapshots_batch(
+    records: List[Dict[str, Any]],
+    protected_symbols: Optional[set] = None,
+) -> None:
+    """Inserta snapshots del ciclo — solo los que superen SNAPSHOT_MIN_SCORE,
+    salvo los símbolos en `protected_symbols` (se insertan siempre).
 
     Filtrar aquí reduce el volumen de escrituras de ~288k filas/día (todos los
     símbolos) a ~50-80k filas/día (solo los interesantes), aliviando el lock.
+
+    El filtro por score es aceptable para el precio (un ciclo perdido solo
+    deja un segmento interpolado un poco menos fino), pero rompe cualquier
+    reconstrucción de CVD acumulado (ej. el "CVD de sesión" del gráfico de
+    Value Area en main.py): es una suma, y un ciclo descartado no se puede
+    "saltar" — el total queda mal para el resto de la sesión. Por eso los
+    símbolos con exposición real (get_symbols_with_open_exposure) deben
+    persistir su delta siempre, sin importar el score de ese ciclo puntual.
     """
     if not records:
         return
-    filtered = [r for r in records if (r.get("score_data") or {}).get("score", 0) >= SNAPSHOT_MIN_SCORE]
+    protected = protected_symbols or set()
+    filtered = [
+        r for r in records
+        if r.get("symbol") in protected
+        or (r.get("score_data") or {}).get("score", 0) >= SNAPSHOT_MIN_SCORE
+    ]
     if not filtered:
         return
     try:
@@ -677,9 +385,42 @@ def insert_snapshots_batch(records: List[Dict[str, Any]]) -> None:
         conn = _get_conn()
         conn.executemany(_SNAPSHOT_INSERT, rows)
         conn.commit()
-        logger.debug("Snapshots insertados: %d/%d (score>=%d)", len(rows), len(records), SNAPSHOT_MIN_SCORE)
+        logger.debug("Snapshots insertados: %d/%d (score>=%d o protegido)", len(rows), len(records), SNAPSHOT_MIN_SCORE)
     except Exception:
         logger.exception("Error al insertar snapshots")
+
+
+def get_symbols_last_snapshot_time() -> Dict[str, str]:
+    """Ultimo timestamp registrado por simbolo en market_snapshots — usado por
+    snapshot_backfill.py para detectar huecos de downtime real del scanner."""
+    try:
+        rows = _get_conn().execute(
+            "SELECT symbol, MAX(timestamp) AS last_ts FROM market_snapshots GROUP BY symbol"
+        ).fetchall()
+        return {r["symbol"]: r["last_ts"] for r in rows if r["last_ts"]}
+    except Exception:
+        logger.exception("Error obteniendo ultimo timestamp por simbolo")
+        return {}
+
+
+def insert_backfilled_snapshots(records: List[Dict[str, Any]]) -> int:
+    """Inserta snapshots reconstruidos de klines para huecos de downtime real
+    (precio real + delta aproximado via taker_buy_volume, ver
+    snapshot_backfill.py). A diferencia de insert_snapshots_batch, NO filtra
+    por SNAPSHOT_MIN_SCORE — estas filas no tienen score real (existen solo
+    para no dejar huecos de precio/CVD en graficos como Value Area) — y
+    marca is_backfilled=1 para poder distinguirlas de un ciclo real."""
+    if not records:
+        return 0
+    try:
+        rows = [_snapshot_row({**r, "is_backfilled": True}) for r in records]
+        conn = _get_conn()
+        conn.executemany(_SNAPSHOT_INSERT, rows)
+        conn.commit()
+        return len(rows)
+    except Exception:
+        logger.exception("Error al insertar snapshots de backfill")
+        return 0
 
 
 # ── Trade alerts ──────────────────────────────────────────────────────────
@@ -757,8 +498,9 @@ def insert_micro_scalp_alert(data: Dict[str, Any]) -> Optional[int]:
                  entry, take_profit_1, take_profit_2, stop_loss, timeout_minutes,
                  return_3m, return_5m, relative_volume,
                  delta, cvd_15m, footprint_delta, imbalance,
-                 oi_change_pct, funding, status, reasons_json, warnings_json)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?)
+                 oi_change_pct, funding, status, reasons_json, warnings_json,
+                 method, trade_size_usdt)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?)
             """,
             (
                 data.get("timestamp", ""),
@@ -782,6 +524,8 @@ def insert_micro_scalp_alert(data: Dict[str, Any]) -> Optional[int]:
                 data.get("funding", 0.0),
                 json.dumps(data.get("reasons", [])),
                 json.dumps(data.get("warnings", [])),
+                data.get("method", ""),
+                data.get("trade_size_usdt", 0.0),
             ),
         )
         conn.commit()
@@ -1595,6 +1339,31 @@ def get_open_auto_positions() -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def get_symbols_with_open_exposure() -> List[str]:
+    """Simbolos con posicion abierta en cualquiera de los 3 sistemas de
+    trading (pipeline principal, micro-scalp, framework multi-estrategia).
+
+    Usado por run_scanner.py para forzar que estos simbolos sigan
+    escaneandose cada ciclo aunque salgan del top de volumen — perderlos de
+    la lista de candidatos mientras hay exposicion real deja el precio/CVD
+    sin actualizar (ver snapshot_backfill.py, que solo cubre downtime del
+    proceso, no rotacion de candidatos con el scanner corriendo)."""
+    symbols: set = set()
+    try:
+        symbols.update(p["symbol"] for p in get_open_auto_positions())
+    except Exception:
+        logger.exception("Error obteniendo simbolos con auto_positions abiertas")
+    try:
+        symbols.update(a["symbol"] for a in get_open_micro_scalp_alerts())
+    except Exception:
+        logger.exception("Error obteniendo simbolos con micro_scalp_alerts abiertas")
+    try:
+        symbols.update(p["symbol"] for p in get_open_strategy_positions())
+    except Exception:
+        logger.exception("Error obteniendo simbolos con strategy_positions abiertas")
+    return sorted(symbols)
+
+
 def update_auto_position_tp1(position_id: int, tp1_pnl_usdt: float, new_sl: float) -> None:
     conn = _get_conn()
     conn.execute(
@@ -1753,6 +1522,35 @@ def get_latest_symbol_price(symbol: str) -> float:
         return float(row["price"] or 0.0) if row else 0.0
     except Exception:
         return 0.0
+
+
+def get_symbol_price_history(symbol: str, since_iso: str) -> List[Dict[str, Any]]:
+    """Serie de precio (preferentemente futuros, mismo criterio que el resto del
+    modulo) + delta por ciclo para un simbolo desde since_iso — usada para
+    graficar el value area sobre la serie de precio real ya guardada en cada
+    ciclo del scanner, y para reconstruir el CVD acumulado de sesion (misma
+    suma que value_area_core.py hace en memoria: cvd_session += delta)."""
+    try:
+        rows = _get_conn().execute(
+            """
+            SELECT timestamp, COALESCE(NULLIF(futures_price, 0), price) AS price, delta
+            FROM market_snapshots
+            WHERE symbol=? AND timestamp >= ?
+            ORDER BY timestamp ASC
+            """,
+            (symbol, since_iso),
+        ).fetchall()
+        return [
+            {
+                "timestamp": r["timestamp"],
+                "price": float(r["price"] or 0.0),
+                "delta": float(r["delta"] or 0.0),
+            }
+            for r in rows
+        ]
+    except Exception:
+        logger.exception("Error al obtener historial de precio de %s", symbol)
+        return []
 
 
 def get_latest_symbol_context(symbol: str) -> Dict[str, Any]:
@@ -1980,21 +1778,6 @@ def get_news_report(since_hours: float = 1.0) -> Dict[str, Any]:
         return {"predictions": [], "performance": {}}
 
 
-def _iso_to_ts(value: str) -> float:
-    try:
-        return float(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%S")))
-    except Exception:
-        return time.time()
-
-
-def _now_iso() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
-
-
-def _ts_to_iso(ts: float) -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts))
-
-
 def count_recent_auto_losses(symbol: str, action: str, since_hours: float = 6.0) -> int:
     """Cuenta cierres perdedores consecutivos recientes para un simbolo/direccion."""
     try:
@@ -2015,6 +1798,252 @@ def count_recent_auto_losses(symbol: str, action: str, since_hours: float = 6.0)
     except Exception:
         logger.exception("Error contando perdidas consecutivas")
         return 0
+
+
+# ── Multi-strategy framework (paper trading, modulos independientes) ──────
+# Tablas propias (strategy_alerts / strategy_positions), parametrizadas por
+# strategy_id — nunca se mezclan con trade_alerts/auto_positions/micro_scalp_alerts.
+
+def insert_strategy_alert(data: Dict[str, Any]) -> Optional[int]:
+    """Inserta una alerta de una estrategia del framework multi-estrategia."""
+    try:
+        conn = _get_conn()
+        cur = conn.execute(
+            """
+            INSERT INTO strategy_alerts
+                (timestamp, strategy_id, symbol, direction, score, confidence,
+                 entry, take_profit_1, take_profit_2, stop_loss, leverage,
+                 timeout_hours, reasons_json, warnings_json, status)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')
+            """,
+            (
+                data.get("timestamp", ""),
+                data.get("strategy_id", ""),
+                data.get("symbol", ""),
+                data.get("direction", ""),
+                data.get("score", 0),
+                data.get("confidence", 0),
+                data.get("entry", 0.0),
+                data.get("take_profit_1"),
+                data.get("take_profit_2"),
+                data.get("stop_loss", 0.0),
+                data.get("leverage", 1),
+                data.get("timeout_hours", 4.0),
+                json.dumps(data.get("reasons", [])),
+                json.dumps(data.get("warnings", [])),
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except Exception:
+        logger.exception("Error al insertar strategy_alert")
+        return None
+
+
+def insert_strategy_position(data: Dict[str, Any]) -> int:
+    conn = _get_conn()
+    cur = conn.execute(
+        """
+        INSERT INTO strategy_positions
+            (alert_id, strategy_id, symbol, direction, mode, open_time,
+             entry_price, size_usdt, leverage, timeout_hours, tp1, tp2, sl, sl_current)
+        VALUES
+            (:alert_id, :strategy_id, :symbol, :direction, :mode, :open_time,
+             :entry_price, :size_usdt, :leverage, :timeout_hours, :tp1, :tp2, :sl, :sl_current)
+        """,
+        {
+            "mode": data.get("mode", "paper"),
+            "timeout_hours": data.get("timeout_hours", 4.0),
+            **data,
+        },
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_open_strategy_positions(strategy_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    if strategy_id:
+        rows = conn.execute(
+            "SELECT * FROM strategy_positions WHERE status = 'open' AND strategy_id = ? ORDER BY open_time",
+            (strategy_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM strategy_positions WHERE status = 'open' ORDER BY open_time"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def update_strategy_position_tp1(position_id: int, tp1_pnl_usdt: float, new_sl: float) -> None:
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE strategy_positions SET tp1_hit=1, tp1_pnl_usdt=?, sl_current=? WHERE id=?",
+        (tp1_pnl_usdt, new_sl, position_id),
+    )
+    conn.commit()
+
+
+def close_strategy_position(position_id: int, exit_price: float, close_reason: str,
+                            final_pnl_usdt: float, total_pnl_usdt: float,
+                            total_pnl_pct: float) -> None:
+    conn = _get_conn()
+    conn.execute(
+        """
+        UPDATE strategy_positions SET
+            status         = 'closed',
+            close_time     = ?,
+            exit_price     = ?,
+            close_reason   = ?,
+            final_pnl_usdt = ?,
+            total_pnl_usdt = ?,
+            total_pnl_pct  = ?
+        WHERE id = ?
+        """,
+        (_now_iso(), exit_price, close_reason,
+         final_pnl_usdt, total_pnl_usdt, total_pnl_pct,
+         position_id),
+    )
+    conn.commit()
+
+
+def count_recent_strategy_losses(strategy_id: str, symbol: str, direction: str,
+                                 since_hours: float = 6.0) -> int:
+    """Cuenta cierres perdedores consecutivos recientes para una estrategia/simbolo/direccion."""
+    try:
+        cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+        rows = _get_conn().execute(
+            """SELECT total_pnl_usdt FROM strategy_positions
+               WHERE strategy_id=? AND symbol=? AND direction=? AND status='closed' AND close_time>=?
+               ORDER BY close_time DESC LIMIT 20""",
+            (strategy_id, symbol, direction, cutoff),
+        ).fetchall()
+        consecutive = 0
+        for row in rows:
+            if float(row["total_pnl_usdt"] or 0) < 0:
+                consecutive += 1
+            else:
+                break
+        return consecutive
+    except Exception:
+        logger.exception("Error contando perdidas consecutivas de estrategia")
+        return 0
+
+
+def get_strategy_positions_summary(strategy_id: Optional[str] = None,
+                                   since_hours: float = 24.0) -> Dict[str, Any]:
+    conn = _get_conn()
+    cutoff = _ts_to_iso(time.time() - since_hours * 3600)
+    where = "status = 'closed' AND close_time >= ?"
+    params: List[Any] = [cutoff]
+    if strategy_id:
+        where += " AND strategy_id = ?"
+        params.append(strategy_id)
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*)                                                    AS total,
+            SUM(CASE WHEN close_reason = 'tp2'      THEN 1 ELSE 0 END) AS tp2_count,
+            SUM(CASE WHEN close_reason = 'tp1_only' THEN 1 ELSE 0 END) AS tp1_count,
+            SUM(CASE WHEN close_reason IN ('sl','sl_breakeven') THEN 1 ELSE 0 END) AS sl_count,
+            SUM(CASE WHEN close_reason = 'timeout'  THEN 1 ELSE 0 END) AS timeout_count,
+            COALESCE(SUM(total_pnl_usdt), 0.0)                         AS total_pnl_usdt,
+            COALESCE(AVG(total_pnl_pct),  0.0)                         AS avg_pnl_pct
+        FROM strategy_positions
+        WHERE {where}
+        """,
+        params,
+    ).fetchone()
+    return {
+        "total":         row["total"] or 0,
+        "tp2_count":     row["tp2_count"] or 0,
+        "tp1_count":     row["tp1_count"] or 0,
+        "sl_count":      row["sl_count"] or 0,
+        "timeout_count": row["timeout_count"] or 0,
+        "total_pnl_usdt": round(row["total_pnl_usdt"] or 0.0, 4),
+        "avg_pnl_pct":   round(row["avg_pnl_pct"] or 0.0, 2),
+    }
+
+
+def upsert_strategy_symbol_state(data: Dict[str, Any]) -> None:
+    """Guarda el estado por (strategy_id, symbol) de una estrategia del framework
+    multi-estrategia (value area, CVD de sesion, sesgo, divergencia pendiente).
+    El dashboard (proceso separado, solo lee DB) usa esto para mostrar
+    anticipacion/breakout/falso breakout sin acceder al estado en memoria."""
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO strategy_symbol_state
+            (strategy_id, symbol, updated_at, value_area_json, cvd_session,
+             bias, divergence_pending, last_signal_reason)
+        VALUES (?,?,?,?,?,?,?,?)
+        ON CONFLICT(strategy_id, symbol) DO UPDATE SET
+            updated_at         = excluded.updated_at,
+            value_area_json    = excluded.value_area_json,
+            cvd_session        = excluded.cvd_session,
+            bias               = excluded.bias,
+            divergence_pending = excluded.divergence_pending,
+            last_signal_reason = excluded.last_signal_reason
+        """,
+        (
+            data.get("strategy_id", ""),
+            data.get("symbol", ""),
+            data.get("updated_at", _now_iso()),
+            data.get("value_area_json", "{}"),
+            data.get("cvd_session", 0.0),
+            data.get("bias", ""),
+            data.get("divergence_pending", ""),
+            data.get("last_signal_reason", ""),
+        ),
+    )
+    conn.commit()
+
+
+def set_previous_value_area(strategy_id: str, symbol: str, value_area_json: str) -> None:
+    """Guarda el value area de la sesion recien completada como 'anterior' para
+    ese (strategy_id, symbol), asi el dashboard puede graficarla junto a la
+    sesion en construccion. Update dirigido a una sola columna (no el upsert
+    generico de cada ciclo) para no pisarla en cada evaluacion normal."""
+    conn = _get_conn()
+    conn.execute(
+        """
+        INSERT INTO strategy_symbol_state (strategy_id, symbol, updated_at, previous_value_area_json)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(strategy_id, symbol) DO UPDATE SET
+            previous_value_area_json = excluded.previous_value_area_json
+        """,
+        (strategy_id, symbol, _now_iso(), value_area_json),
+    )
+    conn.commit()
+
+
+def get_strategy_symbol_states(strategy_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = _get_conn()
+    if strategy_id:
+        rows = conn.execute(
+            "SELECT * FROM strategy_symbol_state WHERE strategy_id = ? ORDER BY symbol",
+            (strategy_id,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM strategy_symbol_state ORDER BY strategy_id, symbol"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_recent_strategy_positions(limit: int = 50) -> List[Dict[str, Any]]:
+    """Posiciones abiertas + cerradas recientes de todas las estrategias del
+    framework, para mostrar en el dashboard agrupadas por strategy_id."""
+    conn = _get_conn()
+    rows = conn.execute(
+        """
+        SELECT * FROM strategy_positions
+        ORDER BY (status = 'open') DESC, COALESCE(close_time, open_time) DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_news_dashboard(since_hours: float = 24.0, event_limit: int = 40) -> Dict[str, Any]:
@@ -2072,12 +2101,18 @@ def get_news_dashboard(since_hours: float = 24.0, event_limit: int = 40) -> Dict
 # ── Accumulation Watch ─────────────────────────────────────────────────────
 
 def upsert_accumulation_watch(data: Dict[str, Any]) -> None:
-    """Inserta o actualiza el estado de coiling de un símbolo.
+    """Inserta o actualiza el estado de watch de un símbolo — multi-canal:
+    'coiling' (contracción de volatilidad, columnas dedicadas por compat),
+    'volatility_breakout' (expansión ya en marcha), 'funding_extreme' y
+    'oi_acceleration' (ver channel/channel_score/metrics_json, genéricos).
 
     En conflicto (símbolo ya existe), conserva `first_seen`, `funding_at_watch`
     y `price_at_watch` originales (línea base de la "vigilancia"), y solo
-    refresca las métricas de coiling y `last_scan`. El status vuelve a
-    'watching' salvo que ya esté 'ignited'.
+    refresca las métricas del canal que lo detectó y `last_scan`. El status
+    vuelve a 'watching' salvo que ya esté 'ignited'. Si un símbolo califica
+    para más de un canal en scans distintos, el último en escribir gana el
+    campo `channel` mostrado — no se trackea multi-canal por simplicidad,
+    el objetivo es solo que el símbolo se siga escaneando.
     """
     try:
         conn = _get_conn()
@@ -2087,8 +2122,9 @@ def upsert_accumulation_watch(data: Dict[str, Any]) -> None:
             INSERT INTO accumulation_watch (
                 symbol, first_seen, last_scan, coiling_score, contraction_ratio,
                 position_in_range, above_sma50, vol_ratio_7_30, quote_volume,
-                funding_at_watch, price_at_watch, status
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'watching')
+                funding_at_watch, price_at_watch, status,
+                channel, channel_score, metrics_json
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'watching',?,?,?)
             ON CONFLICT(symbol) DO UPDATE SET
                 last_scan = excluded.last_scan,
                 coiling_score = excluded.coiling_score,
@@ -2097,6 +2133,9 @@ def upsert_accumulation_watch(data: Dict[str, Any]) -> None:
                 above_sma50 = excluded.above_sma50,
                 vol_ratio_7_30 = excluded.vol_ratio_7_30,
                 quote_volume = excluded.quote_volume,
+                channel = excluded.channel,
+                channel_score = excluded.channel_score,
+                metrics_json = excluded.metrics_json,
                 status = CASE
                     WHEN accumulation_watch.status = 'ignited' THEN accumulation_watch.status
                     ELSE 'watching'
@@ -2112,6 +2151,9 @@ def upsert_accumulation_watch(data: Dict[str, Any]) -> None:
                 data.get("quote_volume", 0.0),
                 data.get("funding_at_watch", 0.0),
                 data.get("price_at_watch", 0.0),
+                data.get("channel", "coiling"),
+                data.get("channel_score", data.get("coiling_score", 0.0)),
+                json.dumps(data.get("metrics", {})),
             ),
         )
         conn.commit()
@@ -2147,13 +2189,15 @@ def expire_stale_accumulation_watch(max_age_hours: float) -> int:
 
 
 def get_accumulation_watchlist_symbols(limit: int) -> List[str]:
-    """Símbolos activos (watching/ignited) ordenados por coiling_score desc."""
+    """Símbolos activos (watching/ignited) ordenados por channel_score desc —
+    genérico entre canales (coiling, volatility_breakout, funding_extreme,
+    oi_acceleration), no solo coiling_score."""
     try:
         rows = _get_conn().execute(
             """
             SELECT symbol FROM accumulation_watch
             WHERE status IN ('watching', 'ignited')
-            ORDER BY coiling_score DESC
+            ORDER BY channel_score DESC
             LIMIT ?
             """,
             (max(0, int(limit)),),

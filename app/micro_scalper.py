@@ -15,6 +15,11 @@ from app.config import (
     MICRO_SCALP_MIN_RETURN_3M,
     MICRO_SCALP_MAX_SPREAD_PCT,
     MICRO_SCALP_TIMEOUT_MINUTES,
+    MICRO_SCALP_LEVEL_PROXIMITY_PCT,
+    MICRO_SCALP_PATTERN_BOUNCE_BONUS,
+    MICRO_SCALP_LEVEL_METHOD_BONUS,
+    MICRO_SCALP_TRADE_SIZE_USDT,
+    MICRO_SCALP_NIVEL_SIZE_MULTIPLIER,
 )
 
 
@@ -22,13 +27,27 @@ def _direction(action: str) -> int:
     return 1 if action == "MICRO_LONG_SCALP" else -1
 
 
-def _build_setup(action: str, price: float, atr: float) -> Dict[str, Any]:
+def _build_setup(action: str, price: float, atr: float,
+                 structure: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     direction = _direction(action)
     atr = max(float(atr or 0.0), 0.0)
 
     tp1_dist = max(price * 0.0025, atr * 0.8)
     tp2_dist = max(price * 0.0055, atr * 1.5)
     sl_dist = max(price * 0.0025, atr * 0.7)
+
+    # El scalp caza el tramo hasta el siguiente nivel opuesto: si hay una
+    # resistencia (long) o soporte (short) antes del TP, se recorta el TP a
+    # justo antes del nivel — no se pide al precio atravesar la pared.
+    struct = structure or {}
+    opposing = (struct.get("nearest_resistance") if direction == 1
+                else struct.get("nearest_support"))
+    if opposing and price > 0:
+        opp_dist = abs(opposing["price"] - price)
+        min_dist = price * 0.0015          # piso: no degenerar el TP
+        if opp_dist > min_dist:
+            tp1_dist = min(tp1_dist, max(opp_dist * 0.85, min_dist))
+            tp2_dist = min(tp2_dist, max(opp_dist * 0.95, tp1_dist))
 
     tp1 = price + direction * tp1_dist
     tp2 = price + direction * tp2_dist
@@ -54,10 +73,18 @@ def calculate_micro_scalp_score(
     funding: float,
     oi_change_pct: float,
     multi_ex: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, List[str], List[str]]:
-    """Calcula score de scalping para direction='long' o 'short'."""
+    structure: Optional[Dict[str, Any]] = None,
+) -> Tuple[int, List[str], List[str], bool]:
+    """Calcula score de scalping para direction='long' o 'short'.
+
+    El 4to valor retornado (is_level_trigger) indica si la entrada vino del
+    metodo "nivel" (rebote en soporte/resistencia) — se usa para formalizar
+    el metodo y aplicar tamano de posicion mayor, ya que rinde mejor que el
+    momentum puro (ver MICRO_SCALP_LEVEL_METHOD_BONUS/NIVEL_SIZE_MULTIPLIER).
+    """
     is_long = direction == "long"
     pts = 0
+    is_level_trigger = False
     reasons: List[str] = []
     warnings: List[str] = []
 
@@ -78,6 +105,55 @@ def calculate_micro_scalp_score(
     signed_cvd = cvd_15m if is_long else -cvd_15m
     signed_delta = delta if is_long else -delta
     signed_fp = fp_delta if is_long else -fp_delta
+
+    # ── Estructura (señal principal del método): comprar el rebote en soporte,
+    #    vender el rechazo en resistencia; nunca operar contra un nivel recién roto ──
+    struct = structure or {}
+    sup = struct.get("nearest_support")
+    res = struct.get("nearest_resistance")
+    sup_dist = float((sup or {}).get("distance_pct", 999.0) or 999.0)
+    res_dist = float((res or {}).get("distance_pct", 999.0) or 999.0)
+    brk = struct.get("breakout") or {}
+    bounce_pattern = next(
+        (p for p in struct.get("patterns", [])
+         if p.get("bounce_valid") and p.get("direction") == ("long" if is_long else "short")),
+        None,
+    )
+
+    if is_long:
+        if sup and sup_dist <= MICRO_SCALP_LEVEL_PROXIMITY_PCT:
+            pts += 12 + MICRO_SCALP_LEVEL_METHOD_BONUS
+            is_level_trigger = True
+            reasons.append(f"Rebote en soporte de {sup['touches']} toques ({sup_dist:.2f}%)")
+            if bounce_pattern:
+                pts += MICRO_SCALP_PATTERN_BOUNCE_BONUS
+                reasons.append(
+                    f"Rebote confirma 2a pata de {bounce_pattern['pattern']} "
+                    f"(progreso {bounce_pattern['bounce_progress_pct']:.0f}%)"
+                )
+        if res and res_dist <= MICRO_SCALP_LEVEL_PROXIMITY_PCT:
+            pts -= 10
+            warnings.append(f"Pegado a resistencia ({res_dist:.2f}%) — sin recorrido para el TP")
+        if brk.get("confirmed") and brk.get("direction") == "down":
+            pts -= 12
+            warnings.append("Soporte recién roto a la baja — no comprar el cuchillo")
+    else:
+        if res and res_dist <= MICRO_SCALP_LEVEL_PROXIMITY_PCT:
+            pts += 12 + MICRO_SCALP_LEVEL_METHOD_BONUS
+            is_level_trigger = True
+            reasons.append(f"Rechazo en resistencia de {res['touches']} toques ({res_dist:.2f}%)")
+            if bounce_pattern:
+                pts += MICRO_SCALP_PATTERN_BOUNCE_BONUS
+                reasons.append(
+                    f"Rechazo confirma 2a pata de {bounce_pattern['pattern']} "
+                    f"(progreso {bounce_pattern['bounce_progress_pct']:.0f}%)"
+                )
+        if sup and sup_dist <= MICRO_SCALP_LEVEL_PROXIMITY_PCT:
+            pts -= 10
+            warnings.append(f"Pegado a soporte ({sup_dist:.2f}%) — sin recorrido para el TP")
+        if brk.get("confirmed") and brk.get("direction") == "up":
+            pts -= 12
+            warnings.append("Resistencia recién rota al alza — no vender el impulso")
 
     # ── RVOL — escalonado y con penalización si no hay momentum ──────────
     # Datos: RVOL 1.5-1.9x tiene mejor WR (64%) que RVOL 5x+ (51%).
@@ -169,7 +245,7 @@ def calculate_micro_scalp_score(
                 pts -= 5
                 warnings.append(f"Tendencia externa ({ext_trend}) contradice el scalp")
 
-    return max(0, min(100, pts)), reasons[:8], warnings[:5]
+    return max(0, min(100, pts)), reasons[:8], warnings[:5], is_level_trigger
 
 
 def detect_micro_scalp(
@@ -184,6 +260,7 @@ def detect_micro_scalp(
     oi_change_pct: float,
     multi_ex: Optional[Dict[str, Any]] = None,
     market_regime: Optional[Dict[str, Any]] = None,
+    structure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Retorna una micro-alerta o WAIT."""
     if price <= 0 or open_interest <= 0:
@@ -199,19 +276,21 @@ def detect_micro_scalp(
         return {"action": "WAIT", "score": 0, "confidence": 0,
                 "warnings": ["Sin datos de flujo real (delta=0) — micro-scalp desactivado para este símbolo"]}
 
-    long_score, long_reasons, long_warnings = calculate_micro_scalp_score(
-        "long", technical, metrics, footprint, orderbook, funding, oi_change_pct, multi_ex
+    long_score, long_reasons, long_warnings, long_is_level = calculate_micro_scalp_score(
+        "long", technical, metrics, footprint, orderbook, funding, oi_change_pct,
+        multi_ex, structure,
     )
-    short_score, short_reasons, short_warnings = calculate_micro_scalp_score(
-        "short", technical, metrics, footprint, orderbook, funding, oi_change_pct, multi_ex
+    short_score, short_reasons, short_warnings, short_is_level = calculate_micro_scalp_score(
+        "short", technical, metrics, footprint, orderbook, funding, oi_change_pct,
+        multi_ex, structure,
     )
 
     if long_score >= short_score:
         action = "MICRO_LONG_SCALP"
-        score, reasons, warnings = long_score, long_reasons, long_warnings
+        score, reasons, warnings, is_level = long_score, long_reasons, long_warnings, long_is_level
     else:
         action = "MICRO_SHORT_SCALP"
-        score, reasons, warnings = short_score, short_reasons, short_warnings
+        score, reasons, warnings, is_level = short_score, short_reasons, short_warnings, short_is_level
 
     regime_name = (market_regime or {}).get("regime", "NORMAL")
     if action == "MICRO_LONG_SCALP" and regime_name == "BTC_RISK_OFF":
@@ -230,8 +309,12 @@ def detect_micro_scalp(
             "warnings": warnings,
         }
 
-    setup = _build_setup(action, price, float(technical.get("atr", 0.0) or 0.0))
+    setup = _build_setup(action, price, float(technical.get("atr", 0.0) or 0.0), structure)
     confidence = min(95, score + 5 if score >= MICRO_SCALP_STRONG_SCORE else score)
+    method = "nivel" if is_level else "momentum"
+    trade_size_usdt = MICRO_SCALP_TRADE_SIZE_USDT * (
+        MICRO_SCALP_NIVEL_SIZE_MULTIPLIER if is_level else 1.0
+    )
 
     return {
         "timestamp": "",
@@ -248,4 +331,6 @@ def detect_micro_scalp(
         "oi_change_pct": oi_change_pct,
         "reasons": reasons,
         "warnings": warnings,
+        "method": method,
+        "trade_size_usdt": round(trade_size_usdt, 2),
     }

@@ -6,6 +6,9 @@ import os
 import sys
 import time as _time
 import warnings
+from zoneinfo import ZoneInfo
+
+_NY_TZ = ZoneInfo("America/New_York")
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="plotly")
 warnings.filterwarnings("ignore", category=FutureWarning, module="pandas")
@@ -16,7 +19,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.log_setup import setup_logging
 setup_logging()
@@ -29,8 +32,13 @@ from app.config import (
     SCANNER_RESULT_LIMIT,
     ENABLE_DATABASE,
     NEAR_MISS_THRESHOLD,
+    MULTI_STRATEGY_ENABLED,
+    MICRO_SCALP_TRADE_SIZE_USDT,
 )
 from app import database
+from app.auto_trader import calc_pnl as _calc_pnl_auto
+from app.strategies import engine as _strategy_engine
+from app.strategies.value_area_core import METHOD_DESCRIPTIONS as _METHOD_DESCRIPTIONS_MAIN
 
 
 def _utc_to_local(ts_utc: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
@@ -42,6 +50,13 @@ def _utc_to_local(ts_utc: str, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
         return dt.astimezone(tz=None).strftime(fmt)
     except Exception:
         return ts_utc
+
+
+def _color_dir(val: str) -> str:
+    return {
+        "LONG":  "background-color:#052e16;color:#86efac",
+        "SHORT": "background-color:#450a0a;color:#fca5a5",
+    }.get(val, "")
 
 
 # ── Caché de queries DB ───────────────────────────────────────────────────
@@ -76,6 +91,34 @@ def _cached_news_dashboard(since_hours: float = 24.0, event_limit: int = 40):
 @st.cache_data(ttl=30)
 def _cached_pnl_overview():
     return database.get_pnl_overview()
+
+@st.cache_data(ttl=30)
+def _cached_strategy_positions(limit: int = 50):
+    return database.get_recent_strategy_positions(limit=limit)
+
+@st.cache_data(ttl=30)
+def _cached_strategy_symbol_states():
+    return database.get_strategy_symbol_states()
+
+@st.cache_data(ttl=30)
+def _cached_symbol_price_history(symbol: str, since_iso: str):
+    return database.get_symbol_price_history(symbol, since_iso)
+
+@st.cache_data(ttl=15)
+def _cached_open_auto_positions():
+    return database.get_open_auto_positions()
+
+@st.cache_data(ttl=15)
+def _cached_open_micro_scalp_alerts():
+    return database.get_open_micro_scalp_alerts()
+
+@st.cache_data(ttl=15)
+def _cached_open_strategy_positions():
+    return database.get_open_strategy_positions()
+
+@st.cache_data(ttl=15)
+def _cached_latest_price(symbol: str):
+    return database.get_latest_symbol_price(symbol)
 
 
 def _build_rows_from_db(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -122,6 +165,9 @@ def _build_rows_from_db(snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "spread_pct":           s.get("spread_pct", 0.0),
             "return_1h":            s.get("return_1h", 0.0),
             "return_15m":           s.get("return_15m", 0.0),
+            "return_5m":            s.get("return_5m", 0.0),
+            "return_3m":            s.get("return_3m", 0.0),
+            "structure":            json.loads(s.get("structure_json") or "{}"),
             "vwap":                 s.get("vwap", 0.0),
             "trend_bias":           s.get("trend_bias", "neutral"),
             "above_vwap":           bool(s.get("above_vwap", True)),
@@ -327,6 +373,88 @@ pnl_c3.metric(
     delta_color="off",
 )
 st.caption("PnL realizado acumulado (histórico, paper) · 25 USDT/trade micro · Futures/Spot en USDT")
+
+
+# ── Órdenes activas (unificado: futuros/spot, micro-scalp, framework) ─────
+st.markdown("### 📋 Órdenes activas")
+
+if ENABLE_DATABASE:
+    _active_rows: List[Dict[str, Any]] = []
+
+    for _p in _cached_open_auto_positions():
+        _price = _cached_latest_price(_p["symbol"]) or _p["entry_price"]
+        _pnl = _calc_pnl_auto(_p, _price)
+        _direction = "LONG" if _p["action"] in ("LONG_FUTURES", "BUY_SPOT") else "SHORT"
+        _mercado = "Futuros" if "FUTURES" in _p["action"] else "Spot"
+        _active_rows.append({
+            "Estrategia":  f"{_mercado} (pipeline principal)",
+            "Símbolo":     _p["symbol"],
+            "Dirección":   _direction,
+            "Entrada":     _p["entry_price"],
+            "SL":          _p.get("sl_current") or _p.get("sl"),
+            "TP1":         _p.get("tp1"),
+            "TP2":         _p.get("tp2"),
+            "PnL abierto": _pnl["total_pnl_usdt"],
+            "PnL %":       _pnl["total_pnl_pct"],
+            "Apalanc.":    f"{_p.get('leverage') or 1}x",
+            "Abierta":     _utc_to_local(_p.get("open_time", ""), fmt="%m-%d %H:%M"),
+        })
+
+    for _m in _cached_open_micro_scalp_alerts():
+        _price = _cached_latest_price(_m["symbol"]) or _m["entry"]
+        _sign = 1 if _m["action"] == "MICRO_LONG_SCALP" else -1
+        _pnl_pct = _sign * (_price - _m["entry"]) / _m["entry"] * 100 if _m["entry"] else 0.0
+        _trade_size = _m.get("trade_size_usdt") or MICRO_SCALP_TRADE_SIZE_USDT
+        _active_rows.append({
+            "Estrategia":  f"Micro-scalping ({_m.get('method') or 'momentum'})",
+            "Símbolo":     _m["symbol"],
+            "Dirección":   "LONG" if _sign == 1 else "SHORT",
+            "Entrada":     _m["entry"],
+            "SL":          _m.get("stop_loss"),
+            "TP1":         _m.get("take_profit_1"),
+            "TP2":         _m.get("take_profit_2"),
+            "PnL abierto": round(_pnl_pct / 100 * _trade_size, 4),
+            "PnL %":       round(_pnl_pct, 2),
+            "Apalanc.":    "1x",
+            "Abierta":     _utc_to_local(_m.get("timestamp", ""), fmt="%m-%d %H:%M"),
+        })
+
+    for _s in _cached_open_strategy_positions():
+        _price = _cached_latest_price(_s["symbol"]) or _s["entry_price"]
+        _pnl = _strategy_engine.calc_pnl(_s, _price)
+        _active_rows.append({
+            "Estrategia":  _s["strategy_id"],
+            "Símbolo":     _s["symbol"],
+            "Dirección":   _s["direction"],
+            "Entrada":     _s["entry_price"],
+            "SL":          _s.get("sl_current") or _s.get("sl"),
+            "TP1":         _s.get("tp1"),
+            "TP2":         _s.get("tp2"),
+            "PnL abierto": _pnl["total_pnl_usdt"],
+            "PnL %":       _pnl["total_pnl_pct"],
+            "Apalanc.":    f"{_s.get('leverage') or 1}x",
+            "Abierta":     _utc_to_local(_s.get("open_time", ""), fmt="%m-%d %H:%M"),
+        })
+
+    if _active_rows:
+        _df_active = pd.DataFrame(_active_rows)
+        st.dataframe(
+            _df_active.style
+            .map(_color_dir, subset=["Dirección"])
+            .format({
+                "Entrada": "{:.6g}", "SL": "{:.6g}", "TP1": "{:.6g}", "TP2": "{:.6g}",
+                "PnL abierto": "{:+.2f}", "PnL %": "{:+.2f}",
+            }, na_rep="—"),
+            use_container_width=True,
+            height=min(420, 60 + 35 * len(_df_active)),
+        )
+        st.caption(
+            f"{len(_active_rows)} posiciones abiertas en total — pipeline principal, "
+            "micro-scalping y framework multi-estrategia. PnL abierto estimado con el "
+            "último precio guardado (market_snapshots), no en tiempo real."
+        )
+    else:
+        st.info("No hay órdenes activas en ningún módulo (futuros, spot, micro-scalping o multi-estrategia).")
 
 
 # ── Sección 1: Oportunidades accionables ─────────────────────────────────
@@ -542,6 +670,458 @@ else:
                 )
 
 
+# ── Sección: Setups de estructura (3m) ─────────────────────────────────────
+st.markdown("### 📐 Setups de estructura (3m)")
+st.caption(
+    "Breakouts de nivel y patrones chartistas (H-C-H, dobles techos/pisos) "
+    "confirmados en velas de 3 minutos, con confirmación de flujo: "
+    "Δ delta · CVD 15m · OB orderbook · RVOL volumen relativo."
+)
+
+_PATTERN_LABELS = {
+    "head_and_shoulders":         "H-C-H",
+    "inverse_head_and_shoulders": "H-C-H invertido",
+    "double_top":                 "Doble techo",
+    "double_bottom":              "Doble piso",
+}
+
+
+def _flow_checks(row: Dict[str, Any], direction: str) -> Dict[str, bool]:
+    """4 checks direccionales de órdenes/volumen sobre columnas ya persistidas."""
+    sign = 1 if direction == "LONG" else -1
+    return {
+        "Δ":    sign * float(row.get("delta", 0.0) or 0.0) > 0,
+        "CVD":  sign * float(row.get("cvd_15m", 0.0) or 0.0) > 0,
+        "OB":   sign * float(row.get("imbalance", 0.0) or 0.0) >= 0.08,
+        "RVOL": float(row.get("relative_volume", 1.0) or 1.0) >= 1.5,
+    }
+
+
+def _mk(v: bool) -> str:
+    return "✓" if v else "✗"
+
+
+_setups: List[Dict[str, Any]] = []
+_bouncing: List[Dict[str, Any]] = []
+_forming: List[Dict[str, Any]] = []
+for r in all_rows:
+    _struct = r.get("structure") or {}
+    if not _struct:
+        continue
+    _brk = _struct.get("breakout") or {}
+    _pats = _struct.get("patterns") or []
+
+    if _brk.get("confirmed"):
+        _dir = "LONG" if _brk.get("direction") == "up" else "SHORT"
+        _chk = _flow_checks(r, _dir)
+        _setups.append({
+            "Símbolo":   r["symbol"],
+            "Señal":     "Breakout ↑" if _dir == "LONG" else "Breakout ↓",
+            "Dirección": _dir,
+            "Nivel":     _brk.get("level", 0.0),
+            "Dist %":    _brk.get("margin_pct", 0.0),
+            "Toques":    _brk.get("touches", 0),
+            "RVOL":      round(float(r.get("relative_volume", 1.0) or 1.0), 1),
+            "Δ":         _mk(_chk["Δ"]),
+            "CVD":       _mk(_chk["CVD"]),
+            "OB":        _mk(_chk["OB"]),
+            "Flujo":     f"{sum(_chk.values())}/4",
+            "Score":     r["score"],
+            "Hora":      _utc_to_local(r.get("timestamp", ""), fmt="%H:%M"),
+            "_n":        sum(_chk.values()),
+        })
+    for _p in _pats:
+        _label = _PATTERN_LABELS.get(_p.get("pattern", ""), _p.get("pattern", "?"))
+        _dir = "LONG" if _p.get("direction") == "long" else "SHORT"
+        if _p.get("confirmed"):
+            _chk = _flow_checks(r, _dir)
+            _setups.append({
+                "Símbolo":   r["symbol"],
+                "Señal":     f"{_label} roto",
+                "Dirección": _dir,
+                "Nivel":     _p.get("neckline", 0.0),
+                "Dist %":    _p.get("distance_to_neckline_pct", 0.0),
+                "Toques":    "—",
+                "RVOL":      round(float(r.get("relative_volume", 1.0) or 1.0), 1),
+                "Δ":         _mk(_chk["Δ"]),
+                "CVD":       _mk(_chk["CVD"]),
+                "OB":        _mk(_chk["OB"]),
+                "Flujo":     f"{sum(_chk.values())}/4",
+                "Score":     r["score"],
+                "Hora":      _utc_to_local(r.get("timestamp", ""), fmt="%H:%M"),
+                "_n":        sum(_chk.values()),
+            })
+        elif _p.get("bounce_valid"):
+            _chk = _flow_checks(r, _dir)
+            _bouncing.append({
+                "Símbolo":   r["symbol"],
+                "Patrón":    f"{_label} (2a pata)",
+                "Dirección": _dir,
+                "Progreso %": _p.get("bounce_progress_pct", 0.0),
+                "Velas desde extremo": _p.get("bounce_age_candles", 0),
+                "Neckline":  _p.get("neckline", 0.0),
+                "Δ":         _mk(_chk["Δ"]),
+                "CVD":       _mk(_chk["CVD"]),
+                "OB":        _mk(_chk["OB"]),
+                "Flujo":     f"{sum(_chk.values())}/4",
+                "Score":     r["score"],
+                "Hora":      _utc_to_local(r.get("timestamp", ""), fmt="%H:%M"),
+                "_n":        sum(_chk.values()),
+            })
+        else:
+            _forming.append({
+                "Símbolo":   r["symbol"],
+                "Patrón":    _label,
+                "Dirección": _dir,
+                "Neckline":  _p.get("neckline", 0.0),
+                "Dist. a neckline %": _p.get("distance_to_neckline_pct", 0.0),
+                "Target":    _p.get("target", 0.0),
+                "Score":     r["score"],
+            })
+
+if _setups:
+    _setups.sort(key=lambda x: (-x["_n"], -x["Score"]))
+    _df_setups = pd.DataFrame(_setups).drop(columns=["_n"])
+
+    st.dataframe(
+        _df_setups.style
+        .map(_color_dir, subset=["Dirección"])
+        .format({"Nivel": "{:.6g}", "Dist %": "{:+.2f}", "RVOL": "{:.1f}", "Score": "{:.0f}"}),
+        use_container_width=True,
+        height=min(420, 60 + 35 * len(_df_setups)),
+    )
+else:
+    st.info(
+        "Sin setups de estructura confirmados en este momento. "
+        "Si esta sección nunca muestra datos, el scanner necesita reiniciarse "
+        "para empezar a persistir la estructura 3m (columna structure_json)."
+    )
+
+if _bouncing:
+    st.markdown("**Rebote en 2a pata (pre-ruptura)** — entrada temprana antes de la neckline")
+    _bouncing.sort(key=lambda x: (-x["_n"], -x["Score"]))
+    _df_bouncing = pd.DataFrame(_bouncing).drop(columns=["_n"])
+    st.dataframe(
+        _df_bouncing.style
+        .map(_color_dir, subset=["Dirección"])
+        .format({"Progreso %": "{:.0f}", "Neckline": "{:.6g}", "Score": "{:.0f}"}),
+        use_container_width=True,
+        height=min(320, 60 + 35 * len(_df_bouncing)),
+    )
+
+if _forming:
+    with st.expander(f"⏳ Patrones en formación ({len(_forming)}) — neckline aún sin romper"):
+        _df_forming = pd.DataFrame(_forming)
+        st.dataframe(
+            _df_forming.style.format({
+                "Neckline": "{:.6g}", "Dist. a neckline %": "{:+.2f}",
+                "Target": "{:.6g}", "Score": "{:.0f}",
+            }),
+            use_container_width=True,
+            height=min(320, 60 + 35 * len(_df_forming)),
+        )
+
+
+# ── Framework multi-estrategia: trades y anticipación de tendencia ───────
+if ENABLE_DATABASE and MULTI_STRATEGY_ENABLED:
+    st.markdown("### 🧠 Framework multi-estrategia")
+    st.caption(
+        "Estrategias adicionales, paper trading, independientes del pipeline institucional. "
+        "Cada fila indica a qué estrategia (strategy_id) pertenece la operación."
+    )
+
+    _strat_positions = _cached_strategy_positions(limit=50)
+    if _strat_positions:
+        _sp_rows = []
+        for p in _strat_positions:
+            _sp_rows.append({
+                "Estrategia":  p.get("strategy_id", ""),
+                "Símbolo":     p.get("symbol", ""),
+                "Dirección":   p.get("direction", ""),
+                "Estado":      p.get("status", ""),
+                "Entrada":     p.get("entry_price", 0.0),
+                "Salida":      p.get("exit_price"),
+                "SL":          p.get("sl_current") or p.get("sl"),
+                "TP1":         p.get("tp1"),
+                "TP2":         p.get("tp2"),
+                "PnL $":       p.get("total_pnl_usdt"),
+                "PnL %":       p.get("total_pnl_pct"),
+                "Razón cierre": p.get("close_reason") or "—",
+                "Abierta":     _utc_to_local(p.get("open_time", ""), fmt="%m-%d %H:%M"),
+            })
+        _df_sp = pd.DataFrame(_sp_rows)
+        st.dataframe(
+            _df_sp.style
+            .map(_color_dir, subset=["Dirección"])
+            .format({
+                "Entrada": "{:.6g}", "Salida": "{:.6g}", "SL": "{:.6g}",
+                "TP1": "{:.6g}", "TP2": "{:.6g}",
+                "PnL $": "{:+.2f}", "PnL %": "{:+.2f}",
+            }, na_rep="—"),
+            use_container_width=True,
+            height=min(420, 60 + 35 * len(_df_sp)),
+        )
+    else:
+        st.info("Sin operaciones registradas todavía en el framework multi-estrategia.")
+
+    _va_states = [
+        s for s in _cached_strategy_symbol_states()
+        if s.get("strategy_id", "").startswith("value_area")
+    ]
+    if _va_states:
+        st.markdown("**Value Area + CVD** — anticipación de tendencia, breakout y falso breakout por símbolo")
+        st.caption(
+            "Zona de valor de la sesión overnight (4:30pm-9:30am NY). El % completado y el tiempo "
+            "restante se muestran desde el inicio de la sesión (sin costo); el VAH/VAL/POC recién se "
+            "calcula en los últimos 30 min antes de las 9:30am para no pedir datos de mercado toda la noche."
+        )
+        with st.expander("¿Cómo se forma la zona de valor? (2 métodos corriendo en paralelo)"):
+            st.markdown(
+                "- **value_area_range**: " + _METHOD_DESCRIPTIONS_MAIN.get("range", "") + "\n"
+                "- **value_area_volume70**: " + _METHOD_DESCRIPTIONS_MAIN.get("volume70", "") + "\n\n"
+                "Ambas corren en paralelo para comparar cuál rinde mejor. Una vez formada (9:30am NY), "
+                "el sesgo direccional se confirma con CVD: precio arriba del VAH + CVD positivo → largos; "
+                "precio abajo del VAL + CVD negativo → cortos. Si el precio hace un nuevo extremo de sesión "
+                "sin que el CVD lo confirme, se marca una posible reversión (falso breakout) que se "
+                "confirma cuando el CVD 'rebota' y el precio vuelve a cruzar el punto medio del value area."
+            )
+        _va_rows = []
+        for s in _va_states:
+            _va = json.loads(s.get("value_area_json") or "{}") or {}
+            _status = _va.get("status", "")
+            _pct = _va.get("pct_complete")
+            _has_levels = _va.get("val") is not None
+            if _status == "complete":
+                _status_label = "🟢 Completa"
+            elif _has_levels:
+                _status_label = "🟠 Vista previa"
+            elif _status == "building":
+                _status_label = "🟡 Construyendo (sin datos aún)"
+            else:
+                _status_label = "—"
+
+            _remaining_txt = "—"
+            _session_end = _va.get("session_end")
+            if _session_end:
+                try:
+                    _end_dt = datetime.datetime.fromisoformat(_session_end)
+                    _now_ny = datetime.datetime.now(_NY_TZ)
+                    _delta_s = (_end_dt - _now_ny).total_seconds()
+                    if _delta_s > 0:
+                        _h, _rem = divmod(int(_delta_s), 3600)
+                        _m = _rem // 60
+                        _remaining_txt = f"{_h}h {_m}m para completarse"
+                    else:
+                        _remaining_txt = "completada"
+                except Exception:
+                    pass
+
+            _div = s.get("divergence_pending") or "—"
+            _div_label = {
+                "LONG":  "⚠️ posible reversión alcista",
+                "SHORT": "⚠️ posible reversión bajista",
+            }.get(_div, "—")
+            _va_rows.append({
+                "Estrategia":  s.get("strategy_id", ""),
+                "Símbolo":     s.get("symbol", ""),
+                "Método":      _va.get("method") or "—",
+                "Estado":      _status_label,
+                "% completado": _pct,
+                "Restante":    _remaining_txt,
+                "VAL":         _va.get("val"),
+                "VAH":         _va.get("vah"),
+                "POC":         _va.get("poc"),
+                "CVD sesión":  s.get("cvd_session", 0.0),
+                "Sesgo":       s.get("bias") or "—",
+                "Divergencia": _div_label,
+                "Última señal": s.get("last_signal_reason") or "—",
+                "Actualizado": _utc_to_local(s.get("updated_at", ""), fmt="%H:%M:%S"),
+            })
+        _df_va = pd.DataFrame(_va_rows)
+        st.dataframe(
+            _df_va.style
+            .map(_color_dir, subset=["Sesgo"])
+            .format({
+                "% completado": "{:.0f}%", "VAL": "{:.6g}", "VAH": "{:.6g}",
+                "POC": "{:.6g}", "CVD sesión": "{:+.2f}",
+            }, na_rep="—"),
+            use_container_width=True,
+            height=min(420, 60 + 35 * len(_df_va)),
+        )
+
+        # ── Rectángulo del value area sobre la serie de precio ────────────
+        _va_symbols = sorted({s.get("symbol", "") for s in _va_states})
+        st.markdown(
+            "**Gráfico del value area** — rectángulo VAL-VAH sobre la sesión overnight, "
+            "dibujado sobre la serie de precio de futuros ya guardada por el scanner "
+            "(`market_snapshots`, sin llamadas nuevas a Binance)."
+        )
+        _sel_symbol = st.selectbox("Símbolo", _va_symbols, key="va_chart_symbol")
+        _sel_states = [s for s in _va_states if s.get("symbol") == _sel_symbol]
+
+        _va_by_strategy: Dict[str, Dict[str, Any]] = {}
+        _va_prev_by_strategy: Dict[str, Dict[str, Any]] = {}
+        _earliest_start_ny = None
+        for s in _sel_states:
+            _sid = s.get("strategy_id", "")
+            _va = json.loads(s.get("value_area_json") or "{}") or {}
+            _va_prev = json.loads(s.get("previous_value_area_json") or "{}") or {}
+            if _va.get("val") is not None and _va.get("vah") is not None:
+                _va_by_strategy[_sid] = _va
+            if _va_prev.get("val") is not None and _va_prev.get("vah") is not None:
+                _va_prev_by_strategy[_sid] = _va_prev
+            for _cand in (_va, _va_prev):
+                if _cand.get("val") is None:
+                    continue
+                try:
+                    _start_ny = datetime.datetime.fromisoformat(_cand["session_start"])
+                    if _earliest_start_ny is None or _start_ny < _earliest_start_ny:
+                        _earliest_start_ny = _start_ny
+                except Exception:
+                    pass
+
+        if not _va_by_strategy and not _va_prev_by_strategy:
+            st.info("El value area de este símbolo todavía no tiene niveles (sigue en construcción overnight).")
+        else:
+            _since_utc = _earliest_start_ny.astimezone(datetime.timezone.utc)
+            _hist = _cached_symbol_price_history(_sel_symbol, _since_utc.strftime("%Y-%m-%dT%H:%M:%S"))
+            if not _hist:
+                st.info("Sin historial de precio guardado todavía para este símbolo en el rango de la sesión.")
+            else:
+                _hist_x = []
+                for _h in _hist:
+                    try:
+                        _dt_ny = (
+                            datetime.datetime.fromisoformat(_h["timestamp"])
+                            .replace(tzinfo=datetime.timezone.utc)
+                            .astimezone(_NY_TZ)
+                            .replace(tzinfo=None)
+                        )
+                        _hist_x.append(_dt_ny)
+                    except Exception:
+                        _hist_x.append(None)
+                _hist_y = [h["price"] for h in _hist]
+
+                # ── CVD de sesión reconstruido (misma lógica que value_area_core.py:
+                # cvd_session arranca en 0 en cada apertura 9:30am NY, acumula el
+                # delta de cada ciclo hasta las 4:30pm, y se mantiene en 0 durante
+                # la sesión overnight — no se reconstruye desde un estado en
+                # memoria, se recalcula del historial de `delta` ya persistido) ──
+                _TRADING_START = datetime.time(9, 30)
+                _TRADING_END = datetime.time(16, 30)
+                _cvd_y: List[Optional[float]] = []
+                _cvd_running = 0.0
+                _cvd_session_date = None
+                for _x, _h in zip(_hist_x, _hist):
+                    if _x is None:
+                        _cvd_y.append(None)
+                        continue
+                    _t = _x.time()
+                    if _TRADING_START <= _t < _TRADING_END:
+                        if _cvd_session_date != _x.date():
+                            _cvd_session_date = _x.date()
+                            _cvd_running = 0.0
+                        _cvd_running += float(_h.get("delta", 0.0) or 0.0)
+                        _cvd_y.append(_cvd_running)
+                    else:
+                        _cvd_session_date = None
+                        _cvd_running = 0.0
+                        _cvd_y.append(0.0)
+
+                # ── Cortar la línea en huecos reales de cobertura ──────────
+                # El scanner corre cada ~60-95s; un hueco >15min significa que
+                # el símbolo salió temporalmente de la lista de candidatos (o
+                # falló el fetch), no que el flujo/precio se haya quedado
+                # quieto. Sin este corte, Plotly conecta los dos puntos con
+                # una línea recta (falso "movimiento suave") y el CVD queda
+                # plano en 0 dentro del hueco, que se lee como "sin flujo
+                # institucional" cuando en realidad es "sin datos".
+                _GAP_THRESHOLD_MINUTES = 30.0
+                _plot_x: List[Any] = []
+                _plot_price_y: List[Optional[float]] = []
+                _plot_cvd_y: List[Optional[float]] = []
+                _prev_x: Optional[datetime.datetime] = None
+                for _x, _py, _cy in zip(_hist_x, _hist_y, _cvd_y):
+                    if _x is not None and _prev_x is not None:
+                        _gap_min = (_x - _prev_x).total_seconds() / 60.0
+                        if _gap_min > _GAP_THRESHOLD_MINUTES:
+                            _plot_x.append(_prev_x + (_x - _prev_x) / 2)
+                            _plot_price_y.append(None)
+                            _plot_cvd_y.append(None)
+                    _plot_x.append(_x)
+                    _plot_price_y.append(_py)
+                    _plot_cvd_y.append(_cy)
+                    if _x is not None:
+                        _prev_x = _x
+
+                _va_colors = {"range": "#3b82f6", "volume70": "#f59e0b"}
+                fig_va = go.Figure()
+
+                def _add_va_rect(_sid: str, _va: Dict[str, Any], _is_prev: bool) -> None:
+                    try:
+                        _sx0 = datetime.datetime.fromisoformat(_va["session_start"]).replace(tzinfo=None)
+                        _sx1 = datetime.datetime.fromisoformat(_va["session_end"]).replace(tzinfo=None)
+                    except Exception:
+                        return
+                    _color = _va_colors.get(_va.get("method", ""), "#9ca3af")
+                    _label = f"{_sid} ({_va.get('method', '')}) VAL-VAH" + (" — día anterior" if _is_prev else "")
+                    fig_va.add_trace(go.Scatter(
+                        x=[_sx0, _sx1, _sx1, _sx0, _sx0],
+                        y=[_va["val"], _va["val"], _va["vah"], _va["vah"], _va["val"]],
+                        fill="toself", mode="lines",
+                        fillcolor=_color, opacity=0.12 if _is_prev else 0.22,
+                        line=dict(color=_color, width=1, dash="dash" if _is_prev else "solid"),
+                        name=_label,
+                    ))
+                    fig_va.add_vline(
+                        x=_sx1, line=dict(color=_color, width=1, dash="dot"),
+                    )
+
+                for _sid, _va in _va_prev_by_strategy.items():
+                    _add_va_rect(_sid, _va, _is_prev=True)
+                for _sid, _va in _va_by_strategy.items():
+                    _add_va_rect(_sid, _va, _is_prev=False)
+
+                fig_va.add_trace(go.Scatter(
+                    x=_plot_x, y=_plot_price_y, mode="lines",
+                    line=dict(color="#e5e7eb", width=1.5),
+                    name="Precio (futuros)",
+                    connectgaps=False,
+                ))
+                fig_va.add_trace(go.Scatter(
+                    x=_plot_x, y=_plot_cvd_y, mode="lines",
+                    line=dict(color="#22c55e", width=1.5, dash="dot"),
+                    name="CVD sesión (acumulado)",
+                    yaxis="y2",
+                    connectgaps=False,
+                ))
+                fig_va.add_hline(y=0, line=dict(color="#22c55e", width=0.5, dash="dot"), yref="y2")
+                fig_va.update_layout(
+                    title=dict(text=f"{_sel_symbol} — value area + CVD vs precio (hora NY)", y=0.98),
+                    xaxis_title="Hora NY", yaxis_title="Precio",
+                    yaxis2=dict(title="CVD sesión", overlaying="y", side="right", showgrid=False),
+                    # Legend abajo del grafico, no arriba: con 3-4 series (2 VA +
+                    # precio + CVD) las etiquetas envuelven a 2 lineas y chocan
+                    # con el titulo si se dejan arriba (y=1.02).
+                    legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.5, xanchor="center"),
+                    margin=dict(t=70, b=110),
+                    height=480,
+                )
+                st.plotly_chart(fig_va, use_container_width=True)
+                st.caption(
+                    "La línea punteada vertical marca el fin de la sesión overnight (9:30am NY) — "
+                    "donde el value area queda fijo y arranca el día de trading. La línea verde "
+                    "punteada (eje derecho) es el CVD acumulado de la sesión de trading (9:30am-4:30pm NY) "
+                    "reconstruido del `delta` por ciclo ya guardado en `market_snapshots` — el mismo que "
+                    "usa la estrategia para confirmar el sesgo (precio sobre VAH + CVD>0 → largos, "
+                    "precio bajo VAL + CVD<0 → cortos). Se reinicia en 0 cada 9:30am y queda plano en 0 "
+                    "durante la sesión overnight, igual que el cálculo interno de la estrategia. "
+                    "Los huecos en las líneas (sin conectar) marcan tramos de más de 30 min sin "
+                    "snapshots del símbolo — el token salió temporalmente de la lista de candidatos "
+                    "del scanner; no interpretar esos tramos como precio estable o flujo neutro."
+                )
+
+
 # ── Sección 2: Ranking completo ───────────────────────────────────────────
 st.markdown("### 📊 Ranking de confluencia")
 
@@ -705,17 +1285,26 @@ if display_rows:
 
     signal_counts = df_c["signal"].value_counts().reset_index()
     signal_counts.columns = ["signal", "count"]
-    fig = px.bar(
-        signal_counts, x="signal", y="count",
+    _signal_colors = {
+        "neutral": "#6b7280", "accumulation": "#10b981",
+        "bullish_continuation": "#16a34a", "distribution": "#ef4444",
+        "long_squeeze": "#dc2626", "short_squeeze": "#22c55e",
+    }
+    # px.bar con color discreto rompe aqui: pandas 3.0.3 tiene una regresion
+    # donde groupby(['col'], sort=False).get_group(valor) lanza KeyError aunque
+    # el valor exista (groupby('col') sin lista si funciona) — Plotly Express
+    # usa la forma con lista internamente. Se evita construyendo el bar chart
+    # directo con go.Bar (una traza por señal), sin pasar por ese codigo.
+    fig = go.Figure()
+    for _sig, _cnt in zip(signal_counts["signal"], signal_counts["count"]):
+        fig.add_trace(go.Bar(
+            x=[_sig], y=[_cnt], name=_sig,
+            marker_color=_signal_colors.get(_sig, "#6b7280"),
+        ))
+    fig.update_layout(
         title="Distribución de señales institucionales",
-        color="signal",
-        color_discrete_map={
-            "neutral": "#6b7280", "accumulation": "#10b981",
-            "bullish_continuation": "#16a34a", "distribution": "#ef4444",
-            "long_squeeze": "#dc2626", "short_squeeze": "#22c55e",
-        },
+        xaxis_title="Señal", yaxis_title="Cantidad",
     )
-    fig.update_layout(xaxis_title="Señal", yaxis_title="Cantidad")
     st.plotly_chart(fig, use_container_width=True)
 
 

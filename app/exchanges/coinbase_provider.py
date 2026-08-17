@@ -82,7 +82,7 @@ class CoinbaseProvider:
         GET /products/{product-id}/ticker
         Retorna: price, bid, ask, volume, time
         """
-        data = _fetch(f"/products/{symbol}/ticker", ttl=8.0)
+        data = _fetch(f"/products/{symbol}/ticker", ttl=25.0)
         if not data or "price" not in data:
             return _failed_ticker(self.name, symbol, normalized_symbol,
                                   "no data" if not data else "missing price")

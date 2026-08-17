@@ -44,6 +44,7 @@ from app.config import (
     AUTO_TRADING_SHORT_MIN_SCORE,
     AUTO_TRADING_LOSS_COOLDOWN_COUNT,
     AUTO_TRADING_LOSS_COOLDOWN_HOURS,
+    AUTO_TRADING_FEE_RATE,
 )
 from app.market_regime import is_countertrend_action
 
@@ -384,12 +385,21 @@ def calc_pnl(position: Dict[str, Any], current_price: float) -> Dict[str, float]
     pct = direction * (current_price - entry) / entry * leverage * 100
     open_pnl_usdt = open_size * pct / 100
 
-    total_pnl_usdt = round(tp1_pnl + open_pnl_usdt, 4)
+    # Fees taker sobre notional: entrada completa + salida parcial de TP1 (si
+    # aplica; tp1_pnl_usdt se guarda bruto) + salida de la porción abierta.
+    notional = size * leverage
+    fees_usdt = notional * AUTO_TRADING_FEE_RATE
+    if tp1_hit:
+        fees_usdt += notional * 0.5 * AUTO_TRADING_FEE_RATE
+    fees_usdt += open_size * leverage * AUTO_TRADING_FEE_RATE
+
+    total_pnl_usdt = round(tp1_pnl + open_pnl_usdt - fees_usdt, 4)
     total_pnl_pct  = round(total_pnl_usdt / size * 100, 2)
 
     return {
         "pnl_pct":       round(pct, 2),           # % del precio desde entrada
         "open_pnl_usdt": round(open_pnl_usdt, 4), # P&L de la porción abierta
-        "total_pnl_usdt": total_pnl_usdt,         # tp1 realizado + abierto
+        "fees_usdt":     round(fees_usdt, 4),     # fees simulados (entrada + salidas)
+        "total_pnl_usdt": total_pnl_usdt,         # tp1 realizado + abierto - fees
         "total_pnl_pct":  total_pnl_pct,          # % sobre size_usdt total
     }

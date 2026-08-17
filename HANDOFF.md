@@ -1,7 +1,233 @@
 # Handoff — Estado del proyecto
 
-> Documento de continuidad para retomar trabajo en otra sesión. Última actualización: 2026-07-11.
+> Documento de continuidad para retomar trabajo en otra sesión. Última actualización: 2026-07-27.
 > Para arquitectura general del scanner, ver [README.md](README.md). Este documento cubre **cambios recientes, hallazgos y pendientes** que el README no refleja todavía.
+
+## 0l. Actualización 2026-07-27 — Value Area + CVD en dashboard, backfill de huecos y descubrimiento de candidatos fuera del volumen
+
+Trabajo posterior a §0k, mismo día: visibilidad de CVD en el gráfico de Value Area, reconstrucción de precio/CVD tras downtime real del scanner, y 4 canales nuevos para que el scanner deje de depender solo de volumen para elegir qué escanear.
+
+### Gráfico Value Area + CVD (`app/main.py`)
+
+- Nueva línea de **CVD acumulado de sesión** (eje derecho, verde punteada) sobre el gráfico VAL/VAH existente — reconstruida del `delta` por ciclo ya persistido en `market_snapshots` (`app/database.py::get_symbol_price_history` ahora también devuelve `delta`), replicando en el dashboard exactamente la lógica de `value_area_core.py`: se reinicia en 0 cada 9:30am NY, acumula hasta las 4:30pm, queda plano en 0 en la sesión overnight.
+- **Bug de layout corregido**: el legend horizontal arriba (`y=1.02`) se envolvía a 2 líneas con 3-4 series y chocaba con el título — movido debajo del gráfico.
+- **Corte de huecos reales**: si el gap entre dos snapshots consecutivos del símbolo supera 30 min, la línea (precio y CVD) se corta en vez de conectarse — antes Plotly dibujaba una diagonal "suave" falsa a través de huecos de cobertura, y el CVD quedaba plano en 0 leyéndose como "sin flujo" cuando en realidad era "sin datos". Verificado contra ASTERUSDT: huecos reales de 19h y 13h que cubrían sesiones de trading completas.
+
+⚠️ **Limitación encontrada tras el hecho (usuario preguntó por qué el CVD "no se persiste como el precio")**: el CVD de sesión mostrado en el gráfico se reconstruye en el momento de renderizar (suma del historial de `delta`), no se lee de un valor ya guardado — el acumulador real y correcto (`strategy_symbol_state.cvd_session`) solo retiene el valor ACTUAL, sin historial, así que no sirve para dibujar una línea. La única fuente con historial es `market_snapshots.delta`, pero `insert_snapshots_batch` descarta filas con `score < SNAPSHOT_MIN_SCORE` (30) para controlar volumen de escritura — un hueco así es tolerable para precio (un segmento interpolado más grueso) pero **corrompe cualquier suma acumulada**: un ciclo perdido no se puede "saltar", el total queda mal el resto de la sesión. **Corregido**: `insert_snapshots_batch(records, protected_symbols=...)` ahora acepta símbolos que se insertan siempre sin importar su score; `scripts/run_scanner.py` pasa `database.get_symbols_with_open_exposure()` como protegidos — los símbolos con posición real abierta ya no pierden ciclos de `delta`. Símbolos con value area activa pero SIN posición abierta todavía pueden tener huecos ocasionales por score bajo (no se protegieron para no revertir la reducción deliberada de volumen de escritura — decisión pendiente si se quiere ampliar).
+
+### `app/snapshot_backfill.py` (nuevo) — reconstrucción tras downtime real
+
+`recover_gap_positions()` (existente, `position_monitor.py`) solo resuelve el desenlace de posiciones abiertas durante el downtime — no escribe nada en `market_snapshots`. Nuevo módulo que sí lo hace, ejecutado una vez al iniciar el scanner:
+
+- Por símbolo con historial previo, si el hueco desde su último dato está entre 20 min y 20h (menos = continuidad normal; más = demasiado viejo para valer la pena), pide klines de 1m a Binance para ese rango exacto.
+- **Precio**: `close` real de cada vela. **CVD/delta**: el CVD real viene del tape de trades en vivo (websocket) y no es recuperable retroactivamente trade a trade, pero cada kline de Binance trae `taker_buy_base_asset_volume` — se aproxima `delta_proxy = 2×taker_buy − volumen_total`, con `cvd_15m`/`cvd` como suma rodante del proxy.
+- Migración `007` (sqlite/postgres): columna `is_backfilled` en `market_snapshots`. `database.insert_backfilled_snapshots()` es un INSERT dedicado que **no** filtra por `SNAPSHOT_MIN_SCORE` (estas filas son WAIT/score=0 por construcción).
+- **Límite explícito**: cubre downtime real del proceso, NO cubre un símbolo rotando dentro/fuera de la lista de candidatos mientras el scanner sigue corriendo — para eso, ver la continuidad de exposición abajo.
+
+### Continuidad de exposición + fix de stream del websocket (`scripts/run_scanner.py`, `app/database.py`)
+
+- `database.get_symbols_with_open_exposure()` — símbolos con posición abierta en cualquiera de los 3 sistemas (`auto_positions`, `micro_scalp_alerts`, `strategy_positions`). Se agregan a los candidatos de cada ciclo **sin importar su volumen**, igual que ya se hacía con Accumulation Watch.
+- **Bug encontrado de paso**: el stream del websocket (fuente del delta/CVD real) se armaba con `candidates[:30]`, truncando cualquier símbolo agregado después de esa posición — Accumulation Watch (y ahora exposición abierta) podían quedar en el escaneo pero **sin CVD real** porque nunca entraban al stream. Corregido: el stream ahora usa la lista completa de candidatos.
+
+### Descubrimiento de candidatos fuera del volumen — 3 canales nuevos, watchlist generalizada
+
+El scanner principal (top ~30 por volumen, piso $50M) y Accumulation Watch (coiling, $2M-$50M) comparten el mismo sesgo: solo consideran símbolos ya identificados por volumen o por contracción previa de volatilidad. Migración `008` generaliza `accumulation_watch` de "solo coiling" a watchlist multi-canal (`channel`, `channel_score` genérico de ranking, `metrics_json`); `get_accumulation_watchlist_symbols()` ahora ordena por `channel_score`, no por `coiling_score`.
+
+- **`volatility_breakout`** (`app/accumulation_scanner.py::_classify_channel`) — reutiliza las MISMAS métricas que ya calcula `compute_coiling_metrics()` para el canal coiling: un `contraction_ratio` (ATR reciente/ATR base) **alto** (≥2.5x, `ACCUMULATION_VOLATILITY_BREAKOUT_RATIO`) es una expansión de volatilidad ya en marcha, en vez de la contracción previa a un breakout que mide coiling. Cero llamadas nuevas a Binance.
+- **`funding_extreme`** (`app/candidate_discovery.py::scan_funding_extreme_candidates`) — reutiliza el `funding_map` ya descargado en bloque para el mismo universo $2M-$50M (`ACCUMULATION_FUNDING_EXTREME_THRESHOLD=0.003`). Cero llamadas nuevas.
+- **`oi_acceleration`** (`app/candidate_discovery.py::scan_oi_acceleration_candidates`) — único canal que agrega llamadas nuevas: Binance no tiene un endpoint de OI para todos los símbolos a la vez (`app/market_data.py::get_open_interest_hist`, uno por símbolo vía `/futures/data/openInterestHist`). Flags símbolos con OI ±15% (`ACCUMULATION_OI_ACCELERATION_PCT`) en 24h (`ACCUMULATION_OI_ACCELERATION_LOOKBACK_HOURS`), mismo patrón de pool de hilos que coiling. Cadencia propia (`CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS=6`) separada de `ACCUMULATION_SCAN_INTERVAL_HOURS`.
+- `app/accumulation_scanner.py::_get_universe` renombrado a `get_extended_universe` (público) para que `candidate_discovery.py` lo reutilice sin duplicar el fetch de tickers/funding.
+- Límite conocido y documentado en código: si un símbolo calificara para más de un canal en scans distintos, el último en escribir gana el campo `channel` mostrado — no se trackea atribución multi-canal, el objetivo es solo que el símbolo se siga escaneando.
+
+### Verificación
+
+42 tests nuevos (`test_snapshot_backfill.py`, `test_open_exposure.py`, `test_candidate_discovery.py`, + extensiones a `test_accumulation_scanner.py` y `test_database.py` para `protected_symbols`). Suite completa: **318 passed, 2 skipped**. Pendiente: reiniciar el scanner para que las migraciones `007-008` se apliquen y el nuevo código quede en vivo.
+
+## 0k. Actualización 2026-07-27 — PnL de futuros + refuerzo de micro-scalping (4 frentes)
+
+Diagnóstico 2026-07-25 confirmó con datos reales (no solo proxy 60m) que el pipeline principal de futuros tiene **PnL histórico neto negativo (-31.15 USDT / 1,133 posiciones paper)**: el apalancamiento de `entry_exit.py::_suggest_leverage` (hasta 5x) amplifica el SL mínimo de 2% a pérdidas de -8/-9%, mientras el movimiento real favorable en la ventana de 4h rara vez alcanza el TP1 exigido (≥1.5R). Micro-scalping es la única estrategia consistentemente positiva. Pedido explícito del usuario: mejorar futuros sin dejar de reforzar micro-scalping, con CVD monitoreado en velas de 1m (micro) y 3m (futuros), y visibilidad de órdenes activas por estrategia en el dashboard. Plan completo (aprobado) archivado en el historial de sesión; resumen de lo aplicado:
+
+### Frente A — Correcciones quirúrgicas al pipeline principal
+
+- **`app/setup_calibrator.py::calibrate_setup`** — `risk_score` estaba saturado en 100 para casi todos los grados (rr1≥1.5 y risk_pct≤10% ya vienen garantizados por construcción, esa dimensión no discriminaba). Reformulado para escalar con qué tan por encima de 1.5R está el rr1 real: base 20 + hasta 25 según `rr_quality=(rr1-1.5)/1.5` (cap 1.0) + 10 si hay SL + 20 si `level_ok` + 5 si `0<risk_pct≤3`. Tests existentes (`tests/test_setup_calibrator.py`, 4) siguen pasando sin cambios.
+- **`app/setup_rules.py::evaluate_trade_setup`** — `level_breakout`/`pattern_break` daban el puntaje de gatillo más alto (+18/+16) sin exigir confirmación de momentum, pese a rendir peor en la realidad. Ahora el puntaje alto solo se otorga si además hay `trend_continuation_valid` (mismo criterio que ya usaba `momentum_continuation`); si no, +13/+12. Verificado contra `tests/test_setup_rules_structure.py` (10 tests).
+- **`.env` / `app/config.py`**: `AUTO_TRADING_RISK_CUT_LOSS_PCT` 8→**5** (que el corte de riesgo actúe antes de acercarse a la magnitud de un SL completo).
+- **`.env`**: `AUTO_TRADING_SESSION_ACTIVE_HOURS` `9-22` → **`9-15,16-21`** — excluye horas 15 y 21 UTC específicamente. Verificado con PnL real (no solo WR-proxy) por hora en `auto_positions`: esas dos horas son las peores del bloque activo (-14.51 USDT/66 trades y -11.47 USDT/69 trades respectivamente), pese a que la hora 15 mostraba el MEJOR WR-proxy en el diagnóstico — se priorizó el PnL real sobre el proxy. **No** se reabrió el bloque 00-08 UTC pese a WR-proxy "decente" (20-24%): el PnL real de ese bloque es negativo (-12.63 USDT), consistente con un estudio previo ya documentado en código (90 días × 25 símbolos, Asia con EV negativo a SL2%/TP3%).
+- **`scripts/train_model.py`** — reentrenado sobre datos actuales (el `.pkl` vigente tenía ~18 días de antigüedad respecto al período post-restart). Modelo viejo respaldado en `data/ml_model.pkl.bak-2026-07-04`. Resultado: 543 muestras (265 win/278 loss), accuracy 0.679, AUC-ROC 0.698 (holdout 20%), CV 3-fold 0.605±0.051. Evaluación posterior más profunda (CV 5-fold estratificado 0.657±0.027) comparó 4 configuraciones de hiperparámetros — la actual (200 árboles/depth6/leaf4) sigue siendo la mejor; no se tocó `ML_THRESHOLD=0.52` por falta de evidencia para cambiarlo. ⚠️ Gap pendiente sin resolver: **cero muestras `BUY_SPOT`** en el training set (solo LONG_FUTURES=331, SHORT_FUTURES=148, SELL_SPOT=64) — cualquier probabilidad ML para `BUY_SPOT` es extrapolación pura del modelo.
+
+### Frente B — Nueva estrategia paper "futuros ágil" (`agile_futures`)
+
+Nuevo módulo dentro del framework multi-estrategia ya existente (`app/strategies/`), en paralelo al pipeline principal — no reemplaza nada, permite comparar A/B con datos reales sin arriesgar `calibrated_grade` ni el modelo ML.
+
+- **`app/strategies/agile_futures.py`** (nuevo) — `AgileFuturesStrategy`, id `"agile_futures"`. Entrada **reactiva** (como micro-scalp: exige que el movimiento ya esté en marcha — `RVOL≥1.8` + `return_15m`/`cvd_15m`/`delta`/CVD-de-ventana-3min todos alineados), no anticipatoria como `level_breakout`. Cadencia de evaluación de señal cada 3 min por símbolo (`STRATEGY_AGILE_FUTURES_EVAL_INTERVAL_SECONDS`, throttle en memoria, mismo patrón que el preview-window de `value_area_core.py`); el CVD de esa ventana se acumula cada ciclo del scanner sin costo nuevo (ya viene del websocket). Apalancamiento **fijo y moderado** (3x por defecto, vs hasta 5x de la fórmula del pipeline principal). SL/TP conscientes de estructura: el TP se recorta contra el nivel S/R opuesto más cercano (misma idea que `micro_scalper.py::_build_setup`) en vez de exigir un R:R fijo que casi nunca se alcanza. Timeout propio ~100 min (>30min pedido, más corto que las 4h del pipeline principal). Capital/posiciones/órdenes propios, independientes de `AUTO_TRADING_CAPITAL_USDT` y `MICRO_SCALP_CAPITAL_USDT` (tablas `strategy_alerts`/`strategy_positions`, `strategy_id="agile_futures"`).
+- **`app/strategies/registry.py`** — `AgileFuturesStrategy()` registrada en `STRATEGIES`.
+- **`.env`** — bloque nuevo: `STRATEGY_AGILE_FUTURES_ENABLED=true`, `CAPITAL_USDT=150`, `LEVERAGE=3`, `TIMEOUT_MINUTES=100`, `EVAL_INTERVAL_SECONDS=180`.
+- Verificado con tests sintéticos (señal LONG/SHORT, throttle, recorte de TP con/sin resistencia cercana) y smoke test completo a través de `strategy_engine.evaluate_all()`/`check_positions()` sobre DB temporal aislada.
+
+### Frente C — Refuerzo de micro-scalping
+
+El método "rebote en nivel" ya mostraba mejor WR (36.4% vs 34.0%) y MFE/MAE mucho más controlado (0.88/0.78 vs 3.9/3.54) que el momentum puro, pero solo se podía inferir post-hoc parseando texto de `reasons_json`. Ahora es explícito y se recompensa:
+
+- **Migración `006_micro_scalp_method`** (sqlite + postgres) — `micro_scalp_alerts` gana columnas `method TEXT DEFAULT ''` y `trade_size_usdt REAL DEFAULT 0`.
+- **`app/config.py`** — `MICRO_SCALP_LEVEL_METHOD_BONUS=3` (bono de score cuando el trigger es rebote/rechazo de nivel) y `MICRO_SCALP_NIVEL_SIZE_MULTIPLIER=1.2` (tamaño de posición 20% mayor solo para setups "nivel", sin tocar el capital total del módulo).
+- **`app/micro_scalper.py`** — `calculate_micro_scalp_score` ahora devuelve también `is_level_trigger`; las ramas de rebote en soporte/resistencia suman `+12 + MICRO_SCALP_LEVEL_METHOD_BONUS` en vez de solo `+12`. `detect_micro_scalp` calcula `method="nivel"|"momentum"` y `trade_size_usdt` (base × multiplicador si aplica) y los persiste. Umbrales de momentum puro sin relajar.
+- **`app/database.py`** / **`app/micro_outcome_tracker.py`** — `insert_micro_scalp_alert` guarda las columnas nuevas; el cálculo de `pnl_usdt` usa `trade_size_usdt` por fila con fallback al constante global para filas anteriores a la migración.
+- Cadencia confirmada en velas de **1 minuto** (ya alineada 1:1 con el ciclo del scanner — sin cambios de infraestructura, decisión del usuario tras ver PnL de micro en +27 USDT).
+- ⚠️ Se detectó y corrigió durante la implementación un bug de saturación de score análogo al de `risk_score` (Frente A): con el bono inicial en 6, el escenario "plain" de un test ya sumaba 101→capado en 100, haciendo imposible la diferencia esperada contra el escenario "boosted". Bajado a 3 para que ambos casos queden por debajo del cap y la comparación sea válida.
+
+### Frente D — Dashboard: "Órdenes activas" unificado
+
+Antes, el dashboard no mostraba ninguna tabla de posiciones abiertas del pipeline principal ni de micro-scalping — solo el resumen agregado de PnL y la tabla de `strategy_positions` (ya usada por `value_area`). El usuario no podía ver a qué estrategia pertenecía una orden activa.
+
+- **`app/main.py`** — nueva sección **"📋 Órdenes activas"**, justo después del bloque de métricas "💰 PnL acumulado" y antes de la Sección 1 de oportunidades. Combina en un solo `st.dataframe`, DB-only (sin llamadas API nuevas): `auto_positions` abiertas (pipeline principal, futuros/spot), `micro_scalp_alerts` abiertas (micro-scalping) y `strategy_positions` abiertas (framework multi-estrategia — `value_area_range`, `value_area_volume70`, `agile_futures`), cada fila etiquetada con su estrategia real. PnL abierto calculado con la lógica de `calc_pnl` propia de cada módulo contra `get_latest_symbol_price`.
+- **Bug no relacionado, encontrado durante el reinicio de verificación**: el chart "Distribución de señales institucionales" (`px.bar` con `color="signal"` discreto) crasheaba con `KeyError: 'long_squeeze'` en cada rerun — regresión confirmada de pandas 3.0.3 (`df.groupby(['col'], sort=False).get_group(valor_existente)` lanza `KeyError`; `df.groupby('col')` sin lista funciona bien), no causada por este trabajo. Corregido reemplazando el `px.bar` por `go.Figure()` + un `go.Bar` por valor de señal.
+
+### Verificación y estado
+
+Suite de tests actualizada (`test_setup_rules_structure.py`, `test_micro_scalper_structure.py`) y pasando. Scanner y dashboard reiniciados con todo el código anterior en vivo (confirmado sin excepciones tras varios ciclos de autorefresh). **Pendiente natural**: diagnóstico integral de seguimiento en unos días para comparar `agile_futures` vs. pipeline principal con datos reales antes de decidir si se reemplaza el pipeline o se mantienen ambos en paralelo.
+
+## 0j. Actualización 2026-07-18 — panel "Setups de estructura (3m)" en el dashboard
+
+El usuario quiere ver en el dashboard qué tokens presentan entrada por estructura (breakouts confirmados, H-C-H, dobles techos/pisos) con confirmación de órdenes/volumen, **trabajando con velas 3m por ahora** para evaluar el rendimiento del timeframe.
+
+- **Migración 002** (`migrations/{sqlite,postgres}/002_structure_json.sql`): columna `structure_json TEXT DEFAULT '{}'` en `market_snapshots`. Se aplica sola en el próximo arranque de scanner o dashboard (`init_db` → `apply_migrations`).
+- `app/database.py`: `_compact_structure()` serializa `result["structure_micro"]` acotada (~1 KB: levels top-6 sin metadatos internos, nearest S/R, breakout, patterns, range) → `structure_json` en `_snapshot_row`/`_SNAPSHOT_INSERT`.
+- `scripts/run_scanner.py`: el fetch de klines 3m ya no depende de `MICRO_SCALP_ENABLED` (solo de `ENABLE_STRUCTURE_ANALYSIS`).
+- `app/main.py`: sección nueva **"📐 Setups de estructura (3m)"** entre Oportunidades y Ranking. Muestra tabla de señales confirmadas (breakout ↑/↓ con nivel/toques/margen; patrón roto con neckline) ordenadas por confirmación de flujo — 4 checks direccionales sobre columnas ya persistidas: **Δ delta > 0, CVD 15m > 0, |OB imbalance| ≥ 0.08, RVOL ≥ 1.5** (con signo invertido para SHORT) — más expander "Patrones en formación" (neckline sin romper). `_build_rows_from_db` ahora mapea `structure`, `return_3m`, `return_5m`.
+- Tests: round-trip `structure_json` + cap de `_compact_structure` en `tests/test_database.py`. Suite: 270 passed.
+- Límites conocidos: solo aparecen símbolos con `score >= SNAPSHOT_MIN_SCORE` (filtro existente de `insert_snapshots_batch`) y la ventana del panel es la del slider "max_age" del sidebar. **La columna se llena solo cuando el scanner corre con este código** — reinicio pendiente.
+
+## 0i. Actualización 2026-07-18 — matching de noticias corregido + purga total del histórico
+
+El matching símbolo↔noticia por substring generaba miles de falsos positivos (AUSDT con 4,327 "noticias" porque el artículo inglés "a" matcheaba todo; POWERUSDT con notas de Anker; TRUMPUSDT política; SAMSUNGUSDT teléfonos) y contaminaba `security_event_alerts` con falsos CRITICAL. Accuracy medida (46-49%) no era interpretable con ese ruido.
+
+**Fix** en `app/news_intelligence.py` `_matches_symbol` — jerarquía estricta (cualquiera basta):
+1. Alias del proyecto (`_ALIASES`) con word-boundary (antes substring).
+2. Notación de mercado: `$BASE`, `BASE/USDT`, `BASEUSDT`, `BASE-USD`.
+3. Ticker en MAYÚSCULAS exactas + palabra de contexto cripto (solo len≥3) — los titulares en Title Case producen "Power", no "POWER".
+4. Bigrama adyacente `base token|coin|price|crypto` (solo len≥3).
+Tickers de 1-2 letras solo matchean por reglas 1-2. Los fetchers GDELT/Google ya no incluyen tickers <3 letras sin alias como término de búsqueda. Tests de regresión con los falsos positivos reales en `tests/test_news_intelligence.py` (267 passed).
+
+**Purga (2026-07-18, aprobada por el usuario)**: `scripts/purge_news_data.py --apply` borró **38,281 filas** (26,732 news_events + 11,482 news_predictions + 67 security_event_alerts) con respaldo en `outputs/news_backup_20260718_040245.json.gz` (13.9 MB). **Las métricas de accuracy de noticias arrancan de cero desde esta fecha** — no comparar con históricos previos.
+
+⚠️ **Requiere reiniciar el scanner**: el proceso en ejecución tiene el matching viejo en memoria y siguió insertando entre la corrección y la purga.
+
+## 0h. Actualización 2026-07-17 — estrategia de estructura: S/R, patrones chartistas y breakouts
+
+Reorganización de estrategia solicitada por el usuario: fundamentales de análisis técnico (niveles S/R, H-C-H, dobles techos/pisos, entradas por breakout confirmado) con métodos separados para futuros (breakout + gestión conservadora) y micro-scalp (rebotes en nivel con TP ajustado).
+
+**Módulos nuevos:**
+- `app/structure_levels.py` — `find_pivots()` (swing highs/lows, ventana 3), `build_levels()` (clustering de pivots por proximidad 0.35%, mín. 2 toques), `analyze_structure()` (API principal: niveles + soporte/resistencia más cercanos + breakout con confirmación por margen ATR y RVOL≥1.5). Opera sobre klines 15m×200 (~50h).
+- `app/chart_patterns.py` — `detect_chart_patterns()`: H-C-H, H-C-H invertido, doble techo/piso sobre los pivots; cada patrón reporta neckline y `confirmed` (cierre más allá de la neckline = señal de entrada; sin confirmar = solo advertencia).
+
+**Integración:**
+- `scripts/run_scanner.py` `_scan_symbol`: fetch paralelo de klines 15m (12ª llamada del executor), `result["structure"]` con niveles+breakout+patterns.
+- `app/setup_rules.py`: dos rutas de gatillo nuevas con prioridad sobre las existentes — `level_breakout` (+18, trigger_type `level_breakout_up/down`) y `pattern_break` (+16, p.ej. `head_and_shoulders_break`); nivel estructural ≤1.5% cuenta para `level_ok` (+12); breakout/patrón confirmado EN CONTRA resta 10 c/u. `trigger_type`/`setup_route` se persisten en `trade_alerts` → medible por winrate igual que las rutas previas.
+- `app/micro_scalper.py`: método por niveles — long +12 en rebote de soporte (≤0.4%), −10 pegado a resistencia, −12 si el soporte se acaba de romper (no comprar el cuchillo); espejo para short. `_build_setup()` recorta TP1/TP2 para no pedir atravesar el nivel opuesto (85%/95% de la distancia al nivel). SL sin cambios.
+- Config: bloque `ENABLE_STRUCTURE_ANALYSIS` (default true) + `STRUCTURE_*`, `PATTERN_*`, `MICRO_SCALP_LEVEL_PROXIMITY_PCT` en `app/config.py`.
+- Tests nuevos: `test_structure_levels.py`, `test_chart_patterns.py`, `test_setup_rules_structure.py`, `test_micro_scalper_structure.py`. Suite completa: 254 passed.
+
+Todo es aditivo/observacional: sin gate nuevo, los triggers nuevos solo compiten en el scoring del setup. Validar por winrate de `setup_route='level_breakout'`/`'pattern_break'` tras ~1-2 semanas.
+
+**Ampliación (mismo día, feedback del usuario "debería ser la base, y multi-timeframe"):** la estructura pasó de ser solo un gatillo del setup a ser insumo del análisis completo:
+- `scoring.py`: nuevo componente `_structure_score` (−8 a +15) en `calculate_opportunity_score` — ruptura confirmada alineada con la señal +10, patrón confirmado +6, precio en soporte/resistencia alineado +5, estructura confirmada en contra −8. Se expone como `structure_score` en score_data y sus razones van primero en el reporte.
+- `entry_exit.py`: los niveles S/R (`structure["levels"]`) entran como candidatos junto a VWAP/POC/HVN/GEX en: objetivo de pullback (entrada), stop (bajo soporte / sobre resistencia) y TP1/TP2 (siguiente nivel opuesto). ⚠️ Los pisos vigentes (`_MIN_SL_PCT_FUTURES` 2%, TP1 ≥1.5R) siguen mandando — un SL estructural más ajustado que 2% o un TP más cercano que 1.5R se ven anulados por el piso. Relajarlos es la decisión estratégica pendiente del backtest §0g.
+- `trade_advisor.py`: pasa `structure` a `calculate_entry_exit`.
+- **Multi-timeframe**: `run_scanner._scan_symbol` calcula la estructura ANTES del scoring y en dos marcos — 15m×200 (futuros/spot, `result["structure"]`) y 3m×200 (~10h, `result["structure_micro"]`, config `STRUCTURE_MICRO_KLINES_*`). El micro-scalp usa la de 3m (niveles y patrones a su horizonte real); fallback a 15m si 3m no está.
+- Tests: `test_structure_in_scoring.py`, `test_entry_exit_structure.py`. Suite: 264 passed.
+- Costo: 2 llamadas de klines extra por símbolo/ciclo (13 en total en el executor paralelo — impacto marginal en t_api).
+
+## 0h-bis. 2026-07-17 — fixture de tests escribía en la DB REAL (corregido; limpieza pendiente)
+
+Tras el refactor a `app/db/` (sesión PG, sin commitear), `app/db/sqlite.py` congela `DATABASE_PATH` al importar y el monkeypatch de `fresh_db` dejó de redirigir → los tests escribieron ~36 filas sintéticas en `data/crypto_dashboard.sqlite3` (12 trade_alerts BTCUSDT price=100000, 2 alert_outcomes que contaminan winrate, 11 snapshots, 2 micro, noticias/seguridad/accumulation de prueba).
+
+- ✅ **Corregido**: `database._get_conn()` ahora pasa `DATABASE_PATH` explícito a `_db_connect()` (restaura el punto de parcheo). Verificado: la suite ya no agrega filas a la DB real.
+- ⏳ **Pendiente**: ejecutar `python scripts/cleanup_test_junk.py --apply` (dry-run ya validado: 36 filas, respaldo JSON automático a `outputs/`). Requiere confirmación del usuario por ser borrado en la DB real.
+
+## 0g. Actualización 2026-07-17 — fees simulados en auto-trading paper
+
+El PnL de `auto_positions` no descontaba comisiones, inflando el paper (~0.38% del margen por trade con leverage promedio 3.8x; los fees estimados de 789 cierres post-restart eran $16.83 vs un PnL neto de −$2.29).
+
+- `app/config.py`: nuevo `AUTO_TRADING_FEE_RATE` (default 0.0005 = 0.05% taker por lado sobre notional `size*leverage`).
+- `app/auto_trader.py` `calc_pnl()`: descuenta fee de entrada + fee de la salida parcial TP1 (si aplica) + fee de la salida de la porción abierta. Devuelve campo nuevo `fees_usdt`. Como todos los caminos de cierre (SL/TP2/timeout/risk_cut/hard_cap/gap recovery) pasan por `calc_pnl`, todos quedan netos de fees automáticamente. `tp1_pnl_usdt` se sigue guardando bruto; su fee se descuenta en `calc_pnl`.
+- `app/position_monitor.py`: los dos cierres `tp1_only` (monitor y gap recovery) ahora escriben `total_pnl_usdt/pct` de `calc_pnl` (neto) en vez del `tp1_pnl_usdt` bruto.
+- ⚠️ Los registros históricos en DB siguen siendo brutos — comparar pre/post 2026-07-17 con eso en mente. El hard cap y risk_cut ahora disparan ~0.4% antes (el umbral compara PnL neto), intencional.
+
+Contexto (diagnóstico 2026-07-17, ver `outputs/diagnosticos/`): el WR ajustado 60% del grado A no se refleja en paper porque el edge medido es de ~0.5R a 60m mientras la gestión exige TP1=1.5R — el 68% de las posiciones paper vienen de alertas con outcome 60m `neutral` y el 55% de esas termina perdiendo (el movimiento favorable se revierte antes del TP).
+
+**Backtest TP/SL (mismo día, ver `outputs/diagnosticos/2026-07-17-backtest-tpsl.md`)**: replay de las 789 posiciones paper contra klines 5m reales con fees — **ninguna de las 14 configuraciones TP/SL probadas es rentable** (PF 0.80–0.94). El edge bruto de las entradas (~+0.1%/trade) no cubre los fees (~0.38%). Hallazgos: SL 1.5R > SL 1.0R (el SL actual es cazado), el breakeven post-TP1 destruye valor, SHORT pierde en todas las configs. Único subconjunto positivo: **grado A + LONG con TP0.5R/SL1.5R → +0.38%/trade, WR 72.7% (n=117, muestra pequeña)**. Conclusión: el ajuste necesario es de selección de entradas (A+LONG only), no solo de gestión. Propuesta pendiente de decisión del usuario.
+
+## 0f. Actualización 2026-07-13 — plan de rendimiento (4 items): 2 aplicados, 2 descartados con evidencia
+
+Se validó e implementó (parcialmente) un plan de 4 mejoras de rendimiento. Decisiones finales:
+
+### ✅ Aplicado: `init_db()` ahora usa `apply_migrations()` (Item 4)
+
+`app/database.py` — las ~350 líneas de DDL inline + el mecanismo `_migrate_schema()` fueron reemplazadas por `_db_apply_migrations(conn)` (sistema de `migrations/{sqlite,postgres}/*.sql` + tabla `schema_migrations`). Verificado que `001_initial.sql` es superset exacto del DDL inline + las 59 columnas de `_migrate_schema` (comparación 1:1).
+
+- **Nueva convención: cambios de esquema van como archivos `migrations/{sqlite,postgres}/00N_*.sql`**, ya NO en la lista `new_columns` de `_migrate_schema()`.
+- `_migrate_schema()` se mantiene como red de seguridad post-migraciones (típicamente 0 ALTERs gracias al fix de `PRAGMA table_info`). Retirar en 1-2 releases si sigue en 0.
+- La DB real ya tiene `schema_migrations` con `001_initial.sql` registrada.
+
+### ✅ Aplicado: `signal_json` ya no se persiste (Item 3, versión mínima)
+
+`app/database.py` `_snapshot_row()` — escribe `'{}'` en vez de serializar el dict `signal`. Verificado por grep: su único consumidor era `signal_description` en `main.py`, que nunca se renderiza. Las filas históricas conservan su JSON; la lectura en `main.py:86` funciona con ambos.
+
+### ❌ Descartado con evidencia: índice `(symbol, id DESC)` (Item 2)
+
+Se implementó, se midió y **se revirtió**. Benchmark sobre la DB real (107K filas en `market_snapshots`):
+
+| Configuración | Tiempo query `get_latest_snapshots` |
+|---|---|
+| Planner libre (usa `idx_snapshots_sym_ts`) | **5.36 ms** |
+| Forzando `idx_snapshots_sym_id` (INDEXED BY) | **503.83 ms** (94× peor) |
+
+**Por qué:** en SQLite todo índice incluye implícitamente el rowid, y `id` ES el rowid (INTEGER PRIMARY KEY) — así que `idx_snapshots_sym_ts (symbol, timestamp)` ya es **covering** para la subquery `SELECT symbol, MAX(id) WHERE timestamp >= ? GROUP BY symbol`. El índice propuesto no puede aplicar el filtro de timestamp y obliga a escanear todos los ids por símbolo. El planner nunca lo elegiría, y su único efecto real sería encarecer cada INSERT del scanner. **No reintroducir.**
+
+### ❌ Descartado: cachear figuras Plotly con `st.cache_data` (Item 1)
+
+Dos razones: (1) la propuesta era buggy — el prefijo `_` en `_df_json` hace que Streamlit NO hashee el parámetro, sirviendo figuras stale y rompiendo la reactividad del slider "Top símbolos"; (2) aun corregida, el beneficio es ~nulo: autorefresh (15s) = TTL de datos (15s) y los únicos 2 widgets del dashboard cambian los datos al moverse — no existen reruns "sin cambio de datos" que amortizar.
+
+### ❌ Descartado previamente (ver §0e para no re-evaluar): vaciar `recommendation_json`/`alert_report_json`
+
+Romperían silenciosamente el panel de niveles (que lee `rec["setup"]`, no las columnas nativas), `entry_context`/`timing`/`position_note` (sin columna nativa) y toda la sección de alertas riesgo/squeeze/stress (vive solo en `alert_report_json`).
+
+---
+
+## 0e. Actualización 2026-07-12 — validación de informe de rendimiento externo + veredicto RAM
+
+Se validó un informe de 13 afirmaciones de rendimiento contra el código real. **Conclusión: el informe describía una versión del código que ya no existe** — las "soluciones" que proponía (ThreadPoolExecutor, paralelismo, caché de queries) ya estaban implementadas. NO re-evaluar este informe en el futuro; los veredictos quedan aquí.
+
+### Veredicto RAM (pregunta del usuario)
+
+Medido 2026-07-12: **15.7 GB totales, 2.3 GB libres, commit charge 53.4/58.7 GB** (sobrecompromiso ~3.4× → paginación constante). Consumidores principales: LM Studio, VS Code (~1.5 GB en procesos), WSL, Brave. Scanner ~1.2 GB, dashboard ~0.5 GB.
+
+- ✅ Subir a 32 GB (o 64 GB si se usa LM Studio con modelos grandes) **sí mejora la productividad general** de la máquina.
+- ⚠️ **NO mejorará el ciclo del scanner (~95s)** — está acotado por latencia de red de exchanges externos (timeouts 4s KuCoin/Coinbase/Kraken), no por memoria.
+
+### Resumen de los 13 claims
+
+| Claims | Veredicto |
+|---|---|
+| #1 HTTP serial, #2 SQLite sin pooling, #6 scanner secuencial | ❌ FALSOS — ya hay concurrencia 6×66 (`run_scanner.py:115,721`), conexión por hilo + WAL + busy_timeout (`database.py:23-47`) |
+| #3 migración 100+ ALTER, #5 Plotly sin caché, #8 lock contención, #9 json.loads, #10 subquery | 🟡 PARCIALES — costos reales despreciables (59 ALTER una vez/proceso; queries sí cacheadas con `st.cache_data`; lock solo protege dict ops) |
+| #4 market_snapshots 77 cols, #11 Streamlit re-render, #12 database.py 2210 líneas | ✅ VERDADEROS pero sin acción — purga 7d los mitiga / inherente / mantenibilidad no rendimiento |
+| #7 WS reconexión completa, #13 trade_store sin límite | ✅ VERDADEROS — #13 corregido esta sesión; #7 gap 1-5s solo al rotar símbolos, no justifica complejidad |
+
+### Fixes aplicados
+
+1. **`app/websocket_client.py` — poda de `trade_store`** (claim #13): nuevo `prune_inactive_symbols()` + tracking `_symbol_last_seen`; elimina símbolos fuera del stream actual sin trades en >5 min. Corre cada 5 min en el loop del WS y al reconectar por cambio de símbolos. Log: `WS PRUNE: N símbolos inactivos eliminados`.
+2. **`app/database.py` — `_migrate_schema()` con `PRAGMA table_info`** (claim #3): consulta columnas existentes una vez por tabla y solo ejecuta los ALTER faltantes (0 tras el primer arranque). El try/except queda como red de seguridad ante carreras entre procesos.
+
+Ambos verificados con tests en DB temporal: migración idempotente (0 ALTERs en segunda corrida, columna dropeada se recrea) y poda selectiva correcta.
+
+⚠️ **Gotcha descubierto durante la verificación:** `app/config.py:10` usa `load_dotenv(override=True)` — setear `DATABASE_PATH` como variable de entorno NO sirve para aislar tests (el `.env` la pisa). Para tests, parchear `database.DATABASE_PATH` a nivel de módulo **antes** de abrir conexiones. Un test corrió contra la DB real e hizo DROP de `trade_alerts.watch_type`; se restauró al 100% con `UPDATE trade_alerts SET watch_type = calibrated_grade WHERE calibrated_grade IN ('BULLISH_WATCH','BEARISH_WATCH')` (480 filas — `watch_type` es derivable de `calibrated_grade` por construcción, ver `setup_calibrator.py:53-63`).
+
+### Palanca real de rendimiento (pendiente, no implementada)
+
+Si se quiere bajar el ciclo de ~95s: **negative caching de pares inexistentes en exchanges externos** — los símbolos sin par en KuCoin/Coinbase/Kraken pagan el timeout completo de 4s en cada ciclo. Cachear "símbolo no existe en exchange X" por 24h eliminaría esos 4s recurrentes.
+
+---
 
 ## 0d. Actualización 2026-07-11 — diagnóstico integral (calibración, SL fix, micro-scalp, noticias, sesiones)
 

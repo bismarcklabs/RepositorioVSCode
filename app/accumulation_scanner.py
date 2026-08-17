@@ -10,7 +10,7 @@ aporta un bono de tendencia).
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app import database
 from app.config import (
@@ -18,6 +18,8 @@ from app.config import (
     ACCUMULATION_FUNDING_DROP_THRESHOLD,
     ACCUMULATION_IGNITION_VOLUME_MULT,
     ACCUMULATION_MIN_QUOTE_VOLUME_USDT,
+    ACCUMULATION_VOLATILITY_BREAKOUT_ENABLED,
+    ACCUMULATION_VOLATILITY_BREAKOUT_RATIO,
     ACCUMULATION_WATCH_ENABLED,
     ACCUMULATION_WATCH_EXPIRE_HOURS,
     MIN_QUOTE_VOLUME_USDT,
@@ -145,11 +147,14 @@ def compute_coiling_metrics(klines_1d: List[List[Any]]) -> Optional[Dict[str, An
     }
 
 
-def _get_universe(min_quote_vol: float) -> List[Dict[str, Any]]:
+def get_extended_universe(min_quote_vol: float) -> List[Dict[str, Any]]:
     """Símbolos USDT-perp entre `min_quote_vol` y `MIN_QUOTE_VOLUME_USDT`.
 
     Los símbolos que ya superan `MIN_QUOTE_VOLUME_USDT` son candidatos del
-    scanner principal (top-50) y no necesitan este canal.
+    scanner principal (top-50) y no necesitan este canal. Público (no
+    prefijo `_`) porque candidate_discovery.py reutiliza el mismo universo
+    para sus propios canales (funding_extreme, oi_acceleration) — evita
+    pedir tickers/funding en bloque dos veces por ciclo de scan.
     """
     tickers = {
         t["symbol"]: t
@@ -188,19 +193,54 @@ def _scan_symbol_coiling(symbol: str) -> Optional[Dict[str, Any]]:
     return compute_coiling_metrics(klines)
 
 
+def _classify_channel(
+    metrics: Dict[str, Any],
+    coiling_threshold: float,
+    breakout_ratio: float,
+    breakout_enabled: bool = True,
+) -> Optional[Tuple[str, float]]:
+    """Decide, a partir de las MISMAS métricas de compute_coiling_metrics()
+    (sin pedir datos nuevos), si el símbolo califica para 'coiling'
+    (contracción de volatilidad, heurística backtesteada — ver docstring del
+    módulo) o 'volatility_breakout' (expansión ya en marcha: el mismo
+    contraction_ratio pero invertido — un ATR reciente varias veces mayor al
+    ATR base es un breakout ya ocurriendo, no una contracción previa a uno).
+    Retorna (channel, channel_score) o None si no califica para ninguno."""
+    coiling_score = metrics.get("coiling_score", 0.0)
+    if coiling_score >= coiling_threshold:
+        return "coiling", coiling_score
+
+    if breakout_enabled:
+        contraction_ratio = metrics.get("contraction_ratio", 1.0)
+        if contraction_ratio >= breakout_ratio:
+            # Normalizado a una escala comparable con coiling_score (0-100).
+            breakout_score = min(100.0, contraction_ratio / breakout_ratio * 50.0)
+            return "volatility_breakout", breakout_score
+
+    return None
+
+
 def scan_accumulation_candidates(
     min_quote_vol: Optional[float] = None,
     score_threshold: Optional[float] = None,
+    breakout_ratio: Optional[float] = None,
+    breakout_enabled: Optional[bool] = None,
     max_workers: int = 10,
 ) -> List[Dict[str, Any]]:
-    """Escanea el universo extendido y retorna candidatos con coiling_score
-    >= `score_threshold`, ordenados de mayor a menor score."""
+    """Escanea el universo extendido y retorna candidatos de los canales
+    'coiling' (contracción) y 'volatility_breakout' (expansión ya en marcha),
+    clasificados desde las mismas métricas — ver _classify_channel.
+    Ordenados de mayor a menor channel_score."""
     if min_quote_vol is None:
         min_quote_vol = ACCUMULATION_MIN_QUOTE_VOLUME_USDT
     if score_threshold is None:
         score_threshold = ACCUMULATION_COILING_SCORE_THRESHOLD
+    if breakout_ratio is None:
+        breakout_ratio = ACCUMULATION_VOLATILITY_BREAKOUT_RATIO
+    if breakout_enabled is None:
+        breakout_enabled = ACCUMULATION_VOLATILITY_BREAKOUT_ENABLED
 
-    universe = _get_universe(min_quote_vol)
+    universe = get_extended_universe(min_quote_vol)
     if not universe:
         return []
 
@@ -219,14 +259,20 @@ def scan_accumulation_candidates(
                 continue
             if metrics is None:
                 continue
-            if metrics["coiling_score"] < score_threshold:
+
+            classification = _classify_channel(metrics, score_threshold, breakout_ratio, breakout_enabled)
+            if classification is None:
                 continue
+            channel, channel_score = classification
+
             metrics["symbol"] = item["symbol"]
             metrics["quote_volume"] = item["quote_volume"]
             metrics["funding_rate"] = item["funding_rate"]
+            metrics["channel"] = channel
+            metrics["channel_score"] = channel_score
             candidates.append(metrics)
 
-    candidates.sort(key=lambda x: x["coiling_score"], reverse=True)
+    candidates.sort(key=lambda x: x["channel_score"], reverse=True)
     return candidates
 
 
@@ -249,6 +295,13 @@ def run_accumulation_scan() -> List[Dict[str, Any]]:
                 "quote_volume": c["quote_volume"],
                 "funding_at_watch": c["funding_rate"],
                 "price_at_watch": c["close"],
+                "channel": c["channel"],
+                "channel_score": c["channel_score"],
+                "metrics": {
+                    "contraction_ratio": c["contraction_ratio"],
+                    "position_in_range": c["position_in_range"],
+                    "vol_ratio_7_30": c["vol_ratio_7_30"],
+                },
             })
         except Exception:
             logger.exception("[%s] error guardando accumulation_watch", c.get("symbol"))
@@ -260,9 +313,11 @@ def run_accumulation_scan() -> List[Dict[str, Any]]:
     except Exception:
         logger.exception("Error expirando accumulation_watch")
 
+    n_coiling = sum(1 for c in candidates if c["channel"] == "coiling")
+    n_breakout = len(candidates) - n_coiling
     logger.info(
-        "ACCUMULATION SCAN: %d candidato(s) con coiling_score>=%.0f",
-        len(candidates), ACCUMULATION_COILING_SCORE_THRESHOLD,
+        "ACCUMULATION SCAN: %d coiling (score>=%.0f) + %d volatility_breakout (ratio>=%.1f)",
+        n_coiling, ACCUMULATION_COILING_SCORE_THRESHOLD, n_breakout, ACCUMULATION_VOLATILITY_BREAKOUT_RATIO,
     )
     return candidates
 

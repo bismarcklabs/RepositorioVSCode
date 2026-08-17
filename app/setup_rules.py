@@ -23,7 +23,7 @@ class SetupEvaluation:
     score: int                    # 0-100
     direction: str                # long | short | neutral
     trigger_type: Optional[str]   # tipo de gatillo o None
-    setup_route: str              # classic_trigger | momentum_continuation | none
+    setup_route: str              # level_breakout | pattern_break | classic_trigger | momentum_continuation | none
     reasons: List[str]
     warnings: List[str]
     checklist: Dict[str, bool]
@@ -45,10 +45,13 @@ def evaluate_trade_setup(
     multi_exchange: Optional[Dict[str, Any]] = None,
     trend_continuation_valid: bool = False,
     trend_priority_score: int = 0,
+    structure: Optional[Dict[str, Any]] = None,
 ) -> SetupEvaluation:
     """Evalúa el setup completo y retorna un SetupEvaluation con grado A/B/C/NO_TRADE.
 
-    Dos rutas de calificación:
+    Rutas de calificación (prioridad descendente):
+    - level_breakout: ruptura confirmada de un nivel S/R estructural (15m)
+    - pattern_break: patrón chartista (H-C-H, doble techo/piso) con neckline rota
     - classic_trigger: gatillo de price action (engulfing / rechazo / VWAP reclaim)
     - momentum_continuation: tendencia fuerte sostenida sin gatillo clásico
     """
@@ -113,7 +116,7 @@ def evaluate_trade_setup(
     elif is_short and htf == "bearish":
         score += 5
 
-    # ── 3. Nivel (+15 VP, +8 solo GEX) ───────────────────────────────────────
+    # ── 3. Nivel (+15 VP, +12 S/R estructural, +8 solo GEX) ──────────────────
     vp           = volume_profile or {}
     nearest_type = vp.get("nearest_level_type", "NONE")
     vp_dist      = abs(float(vp.get("distance_to_level_pct", 999.0) or 999.0))
@@ -121,25 +124,85 @@ def evaluate_trade_setup(
     gex         = gex_data or {}
     has_gex_lvl = bool(gex.get("call_wall") or gex.get("put_wall") or gex.get("gamma_flip"))
 
+    struct = structure or {}
+    struct_lvl = struct.get("nearest_support") if is_long else struct.get("nearest_resistance")
+    struct_dist = abs(float((struct_lvl or {}).get("distance_pct", 999.0) or 999.0))
+
     if nearest_type != "NONE" and vp_dist <= 1.0:
         checklist["level_ok"] = True
         score += 15
         reasons.append(f"Precio cerca de nivel VP relevante: {nearest_type} ({vp_dist:.2f}%).")
+    elif struct_lvl and struct_dist <= 1.5:
+        checklist["level_ok"] = True
+        score += 12
+        side = "soporte" if is_long else "resistencia"
+        reasons.append(
+            f"Precio sobre {side} estructural de {struct_lvl['touches']} toques ({struct_dist:.2f}%)."
+        )
     elif has_gex_lvl:
         checklist["level_ok"] = True
         score += 8
         reasons.append("Existe referencia GEX relevante como nivel.")
     else:
-        warnings.append("No hay nivel VP/GEX suficientemente cercano.")
+        warnings.append("No hay nivel VP/S-R/GEX suficientemente cercano.")
 
-    # ── 4. Gatillo (+15) ──────────────────────────────────────────────────────
+    # ── 4. Gatillo (+18 breakout / +16 patrón / +15 clásico / +12 momentum) ───
     trigger_direction = (trigger or {}).get("direction")
     trigger_type_str  = (trigger or {}).get("type", "")
     trigger_strength  = int((trigger or {}).get("strength", 0))
 
     setup_route = "none"
 
-    if is_long and trigger_direction == "long":
+    # Ruta 1: ruptura confirmada de nivel estructural (la entrada "post-breakout")
+    brk = struct.get("breakout")
+    brk_aligned = bool(brk) and brk.get("confirmed") and (
+        (is_long and brk.get("direction") == "up")
+        or (is_short and brk.get("direction") == "down")
+    )
+    # Ruta 2: patrón chartista con neckline rota en la dirección del trade
+    pattern = next(
+        (p for p in struct.get("patterns", [])
+         if p.get("confirmed") and (
+             (is_long and p.get("direction") == "long")
+             or (is_short and p.get("direction") == "short"))),
+        None,
+    )
+    # Ruta 3: rebote en la 2a pata de un doble techo/piso (W/M), pre-neckline —
+    # entrada más temprana que esperar la ruptura confirmada de la ruta 2.
+    bounce = next(
+        (p for p in struct.get("patterns", [])
+         if p.get("bounce_valid") and (
+             (is_long and p.get("direction") == "long")
+             or (is_short and p.get("direction") == "short"))),
+        None,
+    )
+
+    if brk_aligned:
+        checklist["trigger_ok"] = True
+        setup_route = "level_breakout"
+        # level_breakout rinde peor en la practica que classic_trigger/momentum
+        # continuation pese a exigir menos (solo requiere breakout.confirmed,
+        # sin corroborar momentum/CVD reciente) — el puntaje alto (18) solo se
+        # otorga cuando ademas hay confirmacion de tendencia sostenida, igual
+        # que ya exige momentum_continuation. Sin esa confirmacion, puntaje
+        # reducido (13) acorde al desempeno real medido.
+        score += 18 if trend_continuation_valid else 13
+        trigger_type_str = f"level_breakout_{brk['direction']}"
+        reasons.append(
+            f"Breakout confirmado de nivel de {brk['touches']} toques "
+            f"(margen {brk['margin_pct']:.2f}%, RVOL {brk['rvol']:.1f}x)."
+        )
+    elif pattern:
+        checklist["trigger_ok"] = True
+        setup_route = "pattern_break"
+        # Mismo criterio que level_breakout: bono completo (16) solo con
+        # confirmacion de momentum, si no puntaje reducido (12).
+        score += 16 if trend_continuation_valid else 12
+        trigger_type_str = f"{pattern['pattern']}_break"
+        reasons.append(
+            f"Patrón {pattern['pattern']} confirmado — neckline {pattern['neckline']:.6g} rota."
+        )
+    elif is_long and trigger_direction == "long":
         checklist["trigger_ok"] = True
         setup_route = "classic_trigger"
         score += 15
@@ -149,6 +212,15 @@ def evaluate_trade_setup(
         setup_route = "classic_trigger"
         score += 15
         reasons.append(f"Gatillo bajista: {trigger_type_str} (fuerza {trigger_strength}).")
+    elif bounce:
+        checklist["trigger_ok"] = True
+        setup_route = "pattern_bounce"
+        score += 13
+        trigger_type_str = f"{bounce['pattern']}_bounce"
+        reasons.append(
+            f"Rebote en 2a pata de {bounce['pattern']} "
+            f"(progreso {bounce['bounce_progress_pct']:.0f}% hacia neckline) — entrada temprana pre-ruptura."
+        )
     elif trend_continuation_valid:
         # Ruta alternativa: tendencia fuerte y persistente sustituye al gatillo clásico
         checklist["trigger_ok"] = True
@@ -161,6 +233,25 @@ def evaluate_trade_setup(
         )
     else:
         warnings.append("Sin gatillo claro de price action.")
+
+    # Estructura en contra: breakout o patrón confirmado en dirección opuesta
+    if brk and brk.get("confirmed") and not brk_aligned and (
+        (is_long and brk.get("direction") == "down")
+        or (is_short and brk.get("direction") == "up")
+    ):
+        score -= 10
+        warnings.append("Breakout confirmado en dirección contraria al trade.")
+    opposing = next(
+        (p for p in struct.get("patterns", [])
+         if (p.get("confirmed") or p.get("bounce_valid")) and (
+             (is_long and p.get("direction") == "short")
+             or (is_short and p.get("direction") == "long"))),
+        None,
+    )
+    if opposing:
+        score -= 10
+        estado = "confirmado" if opposing.get("confirmed") else "en rebote de 2a pata"
+        warnings.append(f"Patrón chartista contrario {estado}: {opposing['pattern']}.")
 
     # ── 5. Riesgo (+15) ───────────────────────────────────────────────────────
     if setup:

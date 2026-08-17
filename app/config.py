@@ -60,8 +60,17 @@ MICRO_SCALP_BLACKOUT_HOURS_SHORT = _parse_hour_set("MICRO_SCALP_BLACKOUT_HOURS_S
 # ── Feature flags ──────────────────────────────────────────────────────────
 ENABLE_LIQUIDATIONS = os.getenv("ENABLE_LIQUIDATIONS", "true").lower() == "true"
 
-# ── Base de datos local (SQLite) ───────────────────────────────────────────
+# ── Base de datos ──────────────────────────────────────────────────────────
 ENABLE_DATABASE = os.getenv("ENABLE_DATABASE", "true").lower() == "true"
+
+# ── PostgreSQL (activar con USE_POSTGRESQL=true) ───────────────────────────
+PG_HOST     = os.getenv("PG_HOST",     "localhost")
+PG_PORT     = int(os.getenv("PG_PORT", "5434"))
+PG_DB       = os.getenv("PG_DB",       "crypto_dashboard")
+PG_USER     = os.getenv("PG_USER",     "crypto")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "crypto_local")
+
+# ── SQLite (default) ───────────────────────────────────────────────────────
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/crypto_dashboard.sqlite3")
 SNAPSHOT_RETENTION_DAYS = int(os.getenv("SNAPSHOT_RETENTION_DAYS", "7"))
 # Score mínimo para guardar snapshot — filtra ruido y reduce volumen de escritura
@@ -106,7 +115,7 @@ NEWS_OUTCOME_HORIZON_MINUTES = int(os.getenv("NEWS_OUTCOME_HORIZON_MINUTES", "60
 SECURITY_ALERTS_ENABLED = os.getenv("SECURITY_ALERTS_ENABLED", "true").lower() == "true"
 SECURITY_ALERT_MIN_ABS_SCORE = float(os.getenv("SECURITY_ALERT_MIN_ABS_SCORE", "15"))
 SECURITY_ALERT_LOOKBACK_HOURS = float(os.getenv("SECURITY_ALERT_LOOKBACK_HOURS", "168"))
-SECURITY_COLLECTION_INTERVAL_SECONDS = int(os.getenv("SECURITY_COLLECTION_INTERVAL_SECONDS", "300"))
+SECURITY_COLLECTION_INTERVAL_SECONDS = int(os.getenv("SECURITY_COLLECTION_INTERVAL_SECONDS", "1800"))
 SECURITY_GITHUB_REPOS = [
     tuple(part.strip() for part in value.split("|", 1))
     for value in os.getenv(
@@ -138,8 +147,11 @@ AUTO_TRADING_MIN_SCORE     = int(os.getenv("AUTO_TRADING_MIN_SCORE", "70"))
 AUTO_TRADING_TIMEOUT_HOURS = float(os.getenv("AUTO_TRADING_TIMEOUT_HOURS", "4"))
 AUTO_TRADING_RISK_CUT_ENABLED = os.getenv("AUTO_TRADING_RISK_CUT_ENABLED", "true").lower() == "true"
 AUTO_TRADING_RISK_CUT_MIN_HOURS = float(os.getenv("AUTO_TRADING_RISK_CUT_MIN_HOURS", "1"))
-AUTO_TRADING_RISK_CUT_LOSS_PCT = float(os.getenv("AUTO_TRADING_RISK_CUT_LOSS_PCT", "8"))
+AUTO_TRADING_RISK_CUT_LOSS_PCT = float(os.getenv("AUTO_TRADING_RISK_CUT_LOSS_PCT", "5"))
 AUTO_TRADING_PAPER_MAX_LOSS_PCT = float(os.getenv("AUTO_TRADING_PAPER_MAX_LOSS_PCT", "12"))
+# Fee taker simulado por lado sobre el notional (size * leverage). 0.0005 = 0.05%
+# (taker de futuros KuCoin/Binance). Se descuenta en calc_pnl: entrada + cada salida.
+AUTO_TRADING_FEE_RATE = float(os.getenv("AUTO_TRADING_FEE_RATE", "0.0005"))
 AUTO_TRADING_USE_CALIBRATED_GRADE = os.getenv("AUTO_TRADING_USE_CALIBRATED_GRADE", "true").lower() == "true"
 AUTO_TRADING_ALLOWED_CALIBRATED_GRADES: set = {
     x.strip().upper() for x in os.getenv("AUTO_TRADING_ALLOWED_CALIBRATED_GRADES", "A,B,C").split(",") if x.strip()
@@ -155,10 +167,16 @@ AUTO_TRADING_LOSS_COOLDOWN_COUNT = int(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_COU
 AUTO_TRADING_LOSS_COOLDOWN_HOURS = float(os.getenv("AUTO_TRADING_LOSS_COOLDOWN_HOURS", "6"))
 # Gate de sesión horaria UTC: bloquea entradas en horas de baja volatilidad
 # Validado con 90 días × 25 símbolos: Asia (00-08h) tiene EV negativo con SL2%/TP3%
-# Formato: "HH-HH" (inclusive inicio, exclusivo fin), vacío = sin gate
+# (reconfirmado 2026-07-26 con PnL real de auto_positions: bloque 00-07 UTC
+# -12.63 USDT neto — NO reabrir esa ventana con el proxy de WR a 60min, que
+# sobrestima esas horas). Dentro de la ventana activa, PnL real por hora
+# (2026-07-26) mostró 15h UTC y 21h UTC como las peores por lejos (-14.51 y
+# -11.47 USDT pese a que el proxy de 60min marcaba 15h como la "mejor hora")
+# — se excluyen explícitamente.
+# Formato: "HH-HH" (inclusive inicio, exclusivo fin) combinables con coma, vacío = sin gate
 AUTO_TRADING_SESSION_GATE_ENABLED = os.getenv("AUTO_TRADING_SESSION_GATE_ENABLED", "true").lower() == "true"
 AUTO_TRADING_SESSION_ACTIVE_HOURS: set = {
-    h for part in os.getenv("AUTO_TRADING_SESSION_ACTIVE_HOURS", "9-22").split(",")
+    h for part in os.getenv("AUTO_TRADING_SESSION_ACTIVE_HOURS", "9-15,16-21").split(",")
     for h in (range(int(part.split("-")[0]), int(part.split("-")[1])) if "-" in part else [int(part)])
 }
 # Tiers de sizing: score >= umbral → % del capital
@@ -210,6 +228,47 @@ MICRO_SCALP_FORCE_CLOSE_AFTER_MINUTES = int(os.getenv("MICRO_SCALP_FORCE_CLOSE_A
 MICRO_SCALP_ALERT_COOLDOWN_SECONDS = int(os.getenv("MICRO_SCALP_ALERT_COOLDOWN_SECONDS", "180"))
 MICRO_SCALP_CAPITAL_USDT    = float(os.getenv("MICRO_SCALP_CAPITAL_USDT",    "250"))
 MICRO_SCALP_TRADE_SIZE_USDT = float(os.getenv("MICRO_SCALP_TRADE_SIZE_USDT", "25"))
+# Metodo "nivel" (rebote en soporte/resistencia) vs "momentum" puro — nivel
+# mostro mejor WR y MFE/MAE mucho mas controlado en el diagnostico 2026-07-25.
+# Bono de score adicional (encima del +12 estructural ya existente) y tamano
+# de posicion mayor para setups de nivel, sin tocar el capital total del modulo.
+MICRO_SCALP_LEVEL_METHOD_BONUS    = int(os.getenv("MICRO_SCALP_LEVEL_METHOD_BONUS", "3"))
+MICRO_SCALP_NIVEL_SIZE_MULTIPLIER = float(os.getenv("MICRO_SCALP_NIVEL_SIZE_MULTIPLIER", "1.2"))
+
+# ── Multi-strategy framework (paper trading, modulos independientes) ──────
+# Flag maestro unico. La config de cada estrategia individual (capital,
+# tamaño, timeout) vive en el constructor de su propia clase Strategy
+# (app/strategies/*.py), no aqui — asi agregar una estrategia no requiere
+# editar este archivo.
+MULTI_STRATEGY_ENABLED = os.getenv("MULTI_STRATEGY_ENABLED", "false").lower() == "true"
+
+# ── Estructura de mercado: S/R, patrones chartistas y breakouts ────────────
+# Niveles horizontales por clustering de pivots en velas 15m; alimenta el
+# gatillo level_breakout (futuros) y el método de rebote en nivel (micro-scalp).
+ENABLE_STRUCTURE_ANALYSIS     = os.getenv("ENABLE_STRUCTURE_ANALYSIS", "true").lower() == "true"
+STRUCTURE_KLINES_INTERVAL     = os.getenv("STRUCTURE_KLINES_INTERVAL", "15m")
+STRUCTURE_KLINES_LIMIT        = int(os.getenv("STRUCTURE_KLINES_LIMIT", "200"))       # ~50h de 15m
+# Timeframe corto para micro-scalp: los mismos patrones/niveles se forman en 3m
+STRUCTURE_MICRO_KLINES_INTERVAL = os.getenv("STRUCTURE_MICRO_KLINES_INTERVAL", "3m")
+STRUCTURE_MICRO_KLINES_LIMIT    = int(os.getenv("STRUCTURE_MICRO_KLINES_LIMIT", "200"))  # ~10h de 3m
+STRUCTURE_PIVOT_WINDOW        = int(os.getenv("STRUCTURE_PIVOT_WINDOW", "3"))
+STRUCTURE_LEVEL_TOLERANCE_PCT = float(os.getenv("STRUCTURE_LEVEL_TOLERANCE_PCT", "0.35"))
+STRUCTURE_MIN_TOUCHES         = int(os.getenv("STRUCTURE_MIN_TOUCHES", "2"))
+STRUCTURE_MAX_LEVELS          = int(os.getenv("STRUCTURE_MAX_LEVELS", "8"))
+STRUCTURE_BREAKOUT_MIN_RVOL   = float(os.getenv("STRUCTURE_BREAKOUT_MIN_RVOL", "1.5"))
+STRUCTURE_BREAKOUT_LOOKBACK   = int(os.getenv("STRUCTURE_BREAKOUT_LOOKBACK", "3"))    # velas 15m
+# Patrones chartistas (H-C-H, dobles techos/pisos)
+PATTERN_SHOULDER_TOLERANCE_PCT   = float(os.getenv("PATTERN_SHOULDER_TOLERANCE_PCT", "1.5"))
+PATTERN_DOUBLE_TOLERANCE_PCT     = float(os.getenv("PATTERN_DOUBLE_TOLERANCE_PCT", "0.6"))
+PATTERN_MIN_HEAD_PROMINENCE_PCT  = float(os.getenv("PATTERN_MIN_HEAD_PROMINENCE_PCT", "1.0"))
+# Rebote en la 2a pata de un doble techo/piso (W/M) antes de romper la neckline:
+# entrada temprana alternativa a esperar la ruptura confirmada (pattern_break).
+PATTERN_BOUNCE_MAX_AGE_CANDLES   = int(os.getenv("PATTERN_BOUNCE_MAX_AGE_CANDLES", "4"))
+PATTERN_BOUNCE_MIN_PROGRESS_PCT  = float(os.getenv("PATTERN_BOUNCE_MIN_PROGRESS_PCT", "8.0"))
+PATTERN_BOUNCE_MAX_PROGRESS_PCT  = float(os.getenv("PATTERN_BOUNCE_MAX_PROGRESS_PCT", "65.0"))
+# Micro-scalp: proximidad a nivel para el método de rebote (en % del precio)
+MICRO_SCALP_LEVEL_PROXIMITY_PCT  = float(os.getenv("MICRO_SCALP_LEVEL_PROXIMITY_PCT", "0.4"))
+MICRO_SCALP_PATTERN_BOUNCE_BONUS = int(os.getenv("MICRO_SCALP_PATTERN_BOUNCE_BONUS", "8"))
 
 # ── Regimen global BTC (filtro direccional de mercado) ────────────────────
 BTC_REGIME_ENABLED = os.getenv("BTC_REGIME_ENABLED", "true").lower() == "true"
@@ -250,6 +309,37 @@ for _part in os.getenv("ACCUMULATION_ANCHOR_TIMES_UTC", "06:30,13:30").split(","
         ACCUMULATION_ANCHOR_TIMES_UTC.append((int(_h), int(_m)))
     except ValueError:
         continue
+
+# ── Descubrimiento de candidatos fuera del volumen (3 canales adicionales) ──
+# El scanner principal (top ~30 por preliminary_score, piso $50M) y
+# Accumulation Watch (coiling, $2M-$50M) comparten el mismo sesgo: solo
+# consideran simbolos ya identificados por volumen o por contraccion previa
+# de volatilidad. Estos 3 canales reutilizan la misma tabla accumulation_watch
+# (generalizada con channel/channel_score) para sumar simbolos que ninguno de
+# los dos detectaria a tiempo.
+
+# Canal 1 — volatility_breakout: reutiliza las MISMAS metricas ya calculadas
+# por compute_coiling_metrics() (contraction_ratio = ATR reciente/ATR base)
+# — un valor ALTO (expansion) en vez de bajo (contraccion) es un breakout de
+# volatilidad ya en marcha. Cero llamadas nuevas a Binance.
+ACCUMULATION_VOLATILITY_BREAKOUT_ENABLED = os.getenv("ACCUMULATION_VOLATILITY_BREAKOUT_ENABLED", "true").lower() == "true"
+ACCUMULATION_VOLATILITY_BREAKOUT_RATIO = float(os.getenv("ACCUMULATION_VOLATILITY_BREAKOUT_RATIO", "2.5"))
+
+# Canal 2 — funding_extreme: reutiliza el funding_map ya descargado en bloque
+# (get_premium_index_all) para el mismo universo $2M-$50M. Cero llamadas nuevas.
+ACCUMULATION_FUNDING_EXTREME_ENABLED = os.getenv("ACCUMULATION_FUNDING_EXTREME_ENABLED", "true").lower() == "true"
+ACCUMULATION_FUNDING_EXTREME_THRESHOLD = float(os.getenv("ACCUMULATION_FUNDING_EXTREME_THRESHOLD", "0.003"))  # 0.3%
+
+# Canal 3 — oi_acceleration: Binance no tiene un endpoint de OI para todos los
+# simbolos a la vez (solo por simbolo, /futures/data/openInterestHist) — este
+# canal SI agrega llamadas nuevas, una por simbolo del universo, con el mismo
+# patron de pool de hilos que ya usa el scan de coiling.
+ACCUMULATION_OI_ACCELERATION_ENABLED = os.getenv("ACCUMULATION_OI_ACCELERATION_ENABLED", "true").lower() == "true"
+ACCUMULATION_OI_ACCELERATION_PCT = float(os.getenv("ACCUMULATION_OI_ACCELERATION_PCT", "15.0"))  # % cambio
+ACCUMULATION_OI_ACCELERATION_LOOKBACK_HOURS = float(os.getenv("ACCUMULATION_OI_ACCELERATION_LOOKBACK_HOURS", "24"))
+# Cadencia propia (separada de ACCUMULATION_SCAN_INTERVAL_HOURS) porque el
+# barrido de OI por simbolo es el mas costoso de los 3 canales.
+CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS = float(os.getenv("CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS", "6"))
 
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"

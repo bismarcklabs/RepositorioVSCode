@@ -41,9 +41,23 @@ def calibrate_setup(
     trade_setup = setup or {}
     rr1 = float(trade_setup.get("risk_reward_1", 0) or 0)
     risk_pct = float(trade_setup.get("risk_pct", 0) or 0)
-    risk_score = 20 + (55 if checklist.get("risk_ok") else 30 if rr1 >= 1.5 else 0)
-    risk_score += 15 if trade_setup.get("stop_loss") else 0
-    risk_score += 10 if 0 < risk_pct <= 3 else 0
+    # checklist.risk_ok (rr1>=1.5 y risk_pct<=5%) casi siempre es True porque
+    # entry_exit.py ya garantiza ambas cosas por construccion — usarlo como gate
+    # binario satura risk_score en 100 para casi todo el book (confirmado en
+    # diagnostico 2026-07-25: A/B/C/NO_TRADE con risk_score=100.0 identico).
+    # En vez de eso, escalar por CUANTO rr1 supera el minimo (1.5R->3R) y sumar
+    # el bono grande solo si ademas hay un nivel real (VP/S-R/GEX) sosteniendo
+    # el stop — checklist.level_ok si distingue, porque no siempre hay un nivel
+    # cerca del precio.
+    risk_score = 20
+    if rr1 >= 1.5:
+        rr_quality = min(1.0, (rr1 - 1.5) / 1.5)   # 0.0 a 1.5R, 1.0 a 3.0R o mas
+        risk_score += 25 + round(25 * rr_quality)   # 25 a 50
+    if trade_setup.get("stop_loss"):
+        risk_score += 10
+    if checklist.get("level_ok"):
+        risk_score += 20
+    risk_score += 5 if 0 < risk_pct <= 3 else 0
 
     direction_score = max(0, min(100, direction_score))
     entry_score = max(0, min(100, entry_score))

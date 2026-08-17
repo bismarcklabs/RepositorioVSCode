@@ -88,6 +88,7 @@ def build_trade_recommendation(
     gex_data: Optional[Dict[str, Any]] = None,
     multi_exchange_data: Optional[Dict[str, Any]] = None,
     market_regime: Optional[Dict[str, Any]] = None,
+    structure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     score = score_data.get("score", 0)
     warnings = list(score_data.get("warnings", []))
@@ -247,6 +248,7 @@ def build_trade_recommendation(
             technical=technical,
             volume_profile=volume_profile,
             gex_data=gex_data,
+            structure=structure,
         )
         # Si no hay setup válido (sin stop o sin TP1), degradar a WAIT
         if setup is None:

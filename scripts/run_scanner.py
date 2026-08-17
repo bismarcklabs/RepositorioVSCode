@@ -64,11 +64,19 @@ from app.config import (
     ACCUMULATION_SCAN_INTERVAL_HOURS,
     ACCUMULATION_ANCHOR_TIMES_UTC,
     ACCUMULATION_WATCHLIST_MAX_SIZE,
+    ACCUMULATION_FUNDING_EXTREME_ENABLED,
+    ACCUMULATION_OI_ACCELERATION_ENABLED,
+    CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS,
     SHORT_FUTURES_BLACKOUT_HOURS,
     LONG_FUTURES_BLACKOUT_HOURS,
     BUY_SPOT_BLACKOUT_HOURS,
     MICRO_SCALP_BLACKOUT_HOURS_LONG,
     MICRO_SCALP_BLACKOUT_HOURS_SHORT,
+    ENABLE_STRUCTURE_ANALYSIS,
+    STRUCTURE_KLINES_INTERVAL,
+    STRUCTURE_KLINES_LIMIT,
+    STRUCTURE_MICRO_KLINES_INTERVAL,
+    STRUCTURE_MICRO_KLINES_LIMIT,
 )
 from app.footprint import get_footprint
 from app.gex_levels import get_gex_levels
@@ -96,9 +104,13 @@ from app.news_intelligence import run_news_collection, run_security_collection, 
 from app.auto_trader import evaluate_alert as auto_evaluate
 from app.position_monitor import check_positions, send_positions_report, log_pnl_overview, recover_gap_positions
 from app.config import AUTO_TRADING_ENABLED, POSITION_REPORT_INTERVAL_SECONDS
+from app.config import MULTI_STRATEGY_ENABLED
+from app.strategies import engine as strategy_engine
 from app.exchanges.aggregator import get_multi_exchange_snapshot
 from app.ml_predictor import predictor as ml_predictor
 from app.price_action import detect_price_action_trigger
+from app.structure_levels import analyze_structure
+from app.chart_patterns import detect_chart_patterns
 from app.setup_rules import evaluate_trade_setup
 from app.setup_calibrator import calibrate_setup
 from app.trend_continuation import (
@@ -107,6 +119,7 @@ from app.trend_continuation import (
     calculate_trend_priority_score,
 )
 from app.accumulation_scanner import run_accumulation_scan, check_ignition_trigger
+from app.candidate_discovery import run_candidate_discovery_scan
 
 # Pool interno persistente: 6 workers externos × 11 llamadas = 66 tareas simultáneas.
 # Al ser módulo-nivel, los threads (y sus requests.Session thread-local) sobreviven
@@ -404,13 +417,26 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
         f_oi            = _INNER_EXECUTOR.submit(_timed_call, market_data.get_open_interest, symbol)
         f_ob_spot       = _INNER_EXECUTOR.submit(_timed_call, get_orderbook_imbalance, symbol, 20, "spot")
         f_ob_fut        = _INNER_EXECUTOR.submit(_timed_call, get_orderbook_imbalance, symbol, 20, "futures")
-        f_technical     = _INNER_EXECUTOR.submit(_timed_call, get_technical_context, symbol)
         f_vp            = _INNER_EXECUTOR.submit(_timed_call, get_volume_profile, symbol)
-        f_fp            = _INNER_EXECUTOR.submit(_timed_call, get_footprint, symbol)
+        f_fp            = _INNER_EXECUTOR.submit(_timed_call, get_footprint, symbol, ws_trades)
         f_futures_price = _INNER_EXECUTOR.submit(_timed_call, market_data.get_futures_price, symbol)
         f_spot_price    = _INNER_EXECUTOR.submit(_timed_call, market_data.get_spot_price, symbol)
         f_multi_ex      = _INNER_EXECUTOR.submit(_timed_call, get_multi_exchange_snapshot, symbol)
-        f_klines_1m     = _INNER_EXECUTOR.submit(_timed_call, market_data.get_klines, symbol, "1m", 50)
+        f_klines_1m     = _INNER_EXECUTOR.submit(_timed_call, market_data.get_klines, symbol, "1m", 60)
+        f_klines_15m    = (_INNER_EXECUTOR.submit(
+                               _timed_call, market_data.get_klines, symbol,
+                               STRUCTURE_KLINES_INTERVAL, STRUCTURE_KLINES_LIMIT)
+                           if ENABLE_STRUCTURE_ANALYSIS else None)
+        f_klines_3m     = (_INNER_EXECUTOR.submit(
+                               _timed_call, market_data.get_klines, symbol,
+                               STRUCTURE_MICRO_KLINES_INTERVAL, STRUCTURE_MICRO_KLINES_LIMIT)
+                           if ENABLE_STRUCTURE_ANALYSIS else None)
+
+        # klines_1m se espera antes de lanzar technical_context para reutilizarlas
+        # ahi (mismo dato, mismo ciclo) en vez de que ese modulo pida una segunda
+        # vez las mismas velas de 1m a Binance.
+        klines_1m, t_klines_1m = f_klines_1m.result()
+        f_technical = _INNER_EXECUTOR.submit(_timed_call, get_technical_context, symbol, klines_1m)
 
         funding,           t_funding       = f_funding.result()
         oi,                t_oi            = f_oi.result()
@@ -422,7 +448,8 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
         futures_price_raw, t_futures_price = f_futures_price.result()
         price,             t_spot_price    = f_spot_price.result()
         multi_ex,          t_multi_ex      = f_multi_ex.result()
-        klines_1m,         t_klines_1m     = f_klines_1m.result()
+        klines_15m = f_klines_15m.result()[0] if f_klines_15m is not None else []
+        klines_3m  = f_klines_3m.result()[0] if f_klines_3m is not None else []
         orderbook_data   = ob_futures if ob_futures.get("orderbook_available") else ob_spot
         t_api = time.monotonic() - t_api_start
 
@@ -448,6 +475,28 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
         metrics       = calculate_metrics(symbol, ws_trades)
         oi_change_pct = update_open_interest(symbol, oi)
         futures_price = futures_price_raw or price
+
+        # ── Estructura chartista (base del análisis): niveles S/R, breakouts y
+        #    patrones. 15m para futuros/spot; 3m para el horizonte del micro-scalp.
+        structure: Optional[Dict] = None
+        structure_micro: Optional[Dict] = None
+        if ENABLE_STRUCTURE_ANALYSIS:
+            atr_val  = float(technical.get("atr", 0.0) or 0.0)
+            rvol_val = float(technical.get("relative_volume", 1.0) or 1.0)
+            try:
+                if klines_15m:
+                    structure = analyze_structure(klines_15m, atr=atr_val, relative_volume=rvol_val)
+                    if structure is not None:
+                        structure["patterns"] = detect_chart_patterns(klines_15m)
+            except Exception:
+                logger.debug("[%s] análisis de estructura 15m no disponible", symbol)
+            try:
+                if klines_3m:
+                    structure_micro = analyze_structure(klines_3m, atr=atr_val, relative_volume=rvol_val)
+                    if structure_micro is not None:
+                        structure_micro["patterns"] = detect_chart_patterns(klines_3m)
+            except Exception:
+                logger.debug("[%s] análisis de estructura 3m no disponible", symbol)
 
         signal_data = detect_institutional_signal(
             symbol=symbol,
@@ -478,6 +527,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             gex_data=gex,
             oi_change_pct=oi_change_pct,
             multi_exchange_data=multi_ex,
+            structure=structure,
         )
 
         recommendation = build_trade_recommendation(
@@ -494,6 +544,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             gex_data=gex,
             multi_exchange_data=multi_ex,
             market_regime=market_regime,
+            structure=structure,
         )
 
         # ── Price action trigger (paralelo — klines ya recuperados) ──────────
@@ -560,6 +611,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
                     multi_exchange=multi_ex,
                     trend_continuation_valid=trend_continuation_valid,
                     trend_priority_score=trend_score,
+                    structure=structure,
                 )
                 recommendation["setup_evaluation"] = setup_eval.to_dict()
 
@@ -603,6 +655,7 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
                     oi_change_pct=oi_change_pct,
                     multi_ex=multi_ex,
                     market_regime=market_regime,
+                    structure=structure_micro or structure,
                 )
                 micro_scalp["timestamp"] = ts
             except Exception:
@@ -632,6 +685,8 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             "multi_exchange":  multi_ex,
             "market_regime":   market_regime or {},
             "trigger":         trigger,
+            "structure":       structure,
+            "structure_micro": structure_micro,
             "setup_evaluation": setup_eval.to_dict() if setup_eval else None,
             "setup_calibration": setup_calibration,
             # trend continuation
@@ -640,6 +695,11 @@ def _scan_symbol(symbol: str, candidate: Dict[str, Any],
             "momentum_persistence_count": persistence_count,
             "trend_continuation_valid":   trend_continuation_valid,
             "micro_scalp":                micro_scalp,
+            # Klines crudos ya en memoria (cero fetches nuevos) — disponibles para
+            # el framework multi-estrategia (app/strategies/) sin re-consultarlos.
+            "klines_1m":  klines_1m,
+            "klines_15m": klines_15m,
+            "klines_3m":  klines_3m,
         }
 
         ml_predictor.apply_filter(result)
@@ -683,11 +743,31 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
         except Exception:
             logger.exception("Error fusionando accumulation watchlist")
 
+    # Continuidad de exposición: símbolos con posición abierta en cualquiera
+    # de los 3 sistemas (pipeline principal, micro-scalp, framework
+    # multi-estrategia) SIEMPRE se escanean, aunque hayan salido del top de
+    # volumen — perderlos de candidatos deja el precio/CVD/gestión de esa
+    # posición sin actualizar hasta que vuelvan a entrar por volumen.
+    if ENABLE_DATABASE:
+        try:
+            existing_syms = {c["symbol"] for c in candidates}
+            for symbol in database.get_symbols_with_open_exposure():
+                if symbol not in existing_syms:
+                    candidates.append({"symbol": symbol, "quote_volume": 0.0, "preliminary_score": 0.0})
+                    existing_syms.add(symbol)
+        except Exception:
+            logger.exception("Error fusionando símbolos con exposición abierta")
+
     if not candidates:
         logger.warning("Sin candidatos — saltando ciclo")
         return []
 
-    syms = [c["symbol"] for c in candidates[:30]]
+    # Todos los candidatos (incluyendo accumulation watch y exposición
+    # abierta) van al stream del websocket — sin este dato real de trades no
+    # hay delta/CVD confiable para ninguno de ellos. Antes se truncaba a
+    # los primeros 30, dejando sin CVD real a cualquier símbolo agregado
+    # después (accumulation watch, o ahora exposición abierta).
+    syms = [c["symbol"] for c in candidates]
     set_stream_symbols(syms)
     logger.info("Escaneando %d símbolos", len(candidates))
 
@@ -757,7 +837,15 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
 
     t0 = time.monotonic()
     if ENABLE_DATABASE:
-        database.insert_snapshots_batch(results)
+        # Símbolos con posición real abierta nunca deben perder un ciclo de
+        # delta por score bajo puntual — rompería cualquier reconstrucción de
+        # CVD acumulado (suma), aunque para el precio un hueco puntual sea
+        # tolerable (ver docstring de insert_snapshots_batch).
+        try:
+            protected_symbols = set(database.get_symbols_with_open_exposure())
+        except Exception:
+            protected_symbols = set()
+        database.insert_snapshots_batch(results, protected_symbols=protected_symbols)
         database.insert_multi_exchange_batch(results)
         logger.info("Snapshots insertados: %d", len(results))
     t_db_snap = time.monotonic() - t0
@@ -814,12 +902,25 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
             logger.exception("Error procesando micro-alerta %s", symbol)
     t_micro = time.monotonic() - t0
 
+    # ── Framework multi-estrategia: modulos independientes, adicionales al
+    #    pipeline institucional y al micro-scalper. Reutiliza los results ya
+    #    computados (cero fetches nuevos). Ver app/strategies/.
+    t0 = time.monotonic()
+    if MULTI_STRATEGY_ENABLED:
+        for r in results:
+            try:
+                strategy_engine.evaluate_all(r)
+            except Exception:
+                logger.exception("Error en strategy_engine.evaluate_all para %s", r.get("symbol"))
+    t_strategies = time.monotonic() - t0
+
     t_total = time.monotonic() - t_cycle
     logger.info(
         "TIMING CICLO | simbolos=%-2d | candidatos=%4.2fs | regimen=%4.2fs | "
-        "scan=%5.2fs | db_snap=%4.2fs | alertas=%4.2fs(%d) | micro=%4.2fs(%d) | TOTAL=%5.2fs",
+        "scan=%5.2fs | db_snap=%4.2fs | alertas=%4.2fs(%d) | micro=%4.2fs(%d) | "
+        "estrategias=%4.2fs | TOTAL=%5.2fs",
         len(results), t_candidates, t_regime,
-        t_scan, t_db_snap, t_alerts, alerts_sent, t_micro, micro_sent, t_total,
+        t_scan, t_db_snap, t_alerts, alerts_sent, t_micro, micro_sent, t_strategies, t_total,
     )
 
     return results
@@ -842,6 +943,13 @@ def main() -> None:
             recover_gap_positions()
         except Exception:
             logger.exception("Error en recover_gap_positions al inicio")
+
+    if ENABLE_DATABASE:
+        try:
+            from app.snapshot_backfill import backfill_snapshot_gaps
+            backfill_snapshot_gaps()
+        except Exception:
+            logger.exception("Error en backfill_snapshot_gaps al inicio")
 
     # Actualizar caché histórica incremental (solo las velas nuevas desde la última ejecución).
     # No bloquea el scanner si falla — es un best-effort para mantener los scripts de análisis
@@ -886,6 +994,9 @@ def main() -> None:
     _accumulation_anchor_done: Dict[Tuple[int, int], str] = {}  # (h, m) -> "YYYY-MM-DD"
     _accumulation_executor = ThreadPoolExecutor(max_workers=1)
     _accumulation_future = None
+    _last_candidate_discovery_ts = 0.0     # epoch del último scan funding_extreme/oi_acceleration
+    _candidate_discovery_executor = ThreadPoolExecutor(max_workers=1)
+    _candidate_discovery_future = None
 
     # Primer ciclo inmediato; luego esperar entre ciclos
     while True:
@@ -911,12 +1022,27 @@ def main() -> None:
                 except Exception:
                     logger.exception("Error en outcome tracker")
 
+        # Precios ya calculados este ciclo por _scan_symbol — check_positions() los
+        # reusa para los simbolos con posicion abierta que ya fueron escaneados,
+        # en vez de volver a pedirlos a Binance.
+        scanned_prices = {
+            r["symbol"]: {"spot": r.get("price"), "futures": r.get("futures_price")}
+            for r in results
+        }
+
         # Vigilar TP/SL de posiciones abiertas (cada ciclo)
         if AUTO_TRADING_ENABLED:
             try:
-                check_positions()
+                check_positions(scanned_prices)
             except Exception:
                 logger.exception("Error en check_positions")
+
+        # Vigilar TP/SL de posiciones paper del framework multi-estrategia (cada ciclo)
+        if MULTI_STRATEGY_ENABLED:
+            try:
+                strategy_engine.check_positions(scanned_prices)
+            except Exception:
+                logger.exception("Error en strategy_engine.check_positions")
 
         # Reporte de posiciones cada POSITION_REPORT_INTERVAL_SECONDS
         if AUTO_TRADING_ENABLED:
@@ -973,6 +1099,19 @@ def main() -> None:
                     logger.exception("Error iniciando Accumulation Watch scan")
                 finally:
                     _last_accumulation_scan_ts = time.time()
+
+        # Candidate Discovery: funding_extreme (casi gratis, reutiliza el
+        # mismo universo/funding) + oi_acceleration (unico canal con llamadas
+        # nuevas por simbolo) — misma cadencia simple, sin horarios ancla.
+        if ENABLE_DATABASE and (ACCUMULATION_FUNDING_EXTREME_ENABLED or ACCUMULATION_OI_ACCELERATION_ENABLED):
+            if time.time() - _last_candidate_discovery_ts >= CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS * 3600:
+                if _candidate_discovery_future is None or _candidate_discovery_future.done():
+                    try:
+                        _candidate_discovery_future = _candidate_discovery_executor.submit(run_candidate_discovery_scan)
+                    except Exception:
+                        logger.exception("Error iniciando Candidate Discovery scan")
+                    finally:
+                        _last_candidate_discovery_ts = time.time()
 
         # Reporte de win rate periódico — basado en tiempo real, no en ciclos
         if ENABLE_DATABASE and WINRATE_REPORT_ENABLED:

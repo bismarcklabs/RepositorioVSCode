@@ -391,6 +391,70 @@ def _breakout_score(
     return min(15, pts), reasons
 
 
+def _structure_score(
+    structure: Optional[Dict[str, Any]],
+    signal: str,
+) -> Tuple[int, List[str]]:
+    """Estructura chartista: S/R, breakouts de nivel y patrones. Rango -8 a +15.
+
+    A diferencia de _breakout_score (volumen/momentum), esto puntúa geometría:
+    ruptura confirmada de un nivel identificado, patrón con neckline rota y
+    ubicación del precio respecto a soportes/resistencias reales.
+    """
+    if not structure:
+        return 0, []
+
+    pts = 0
+    reasons: List[str] = []
+    bullish = signal in _BULLISH
+    bearish = signal in _BEARISH
+
+    brk = structure.get("breakout") or {}
+    if brk.get("confirmed"):
+        up = brk.get("direction") == "up"
+        aligned = (bullish and up) or (bearish and not up)
+        opposed = (bullish and not up) or (bearish and up)
+        if aligned:
+            pts += 10
+            reasons.append(
+                f"Ruptura confirmada de nivel de {brk.get('touches', 0)} toques "
+                f"({'alza' if up else 'baja'}, margen {brk.get('margin_pct', 0):.2f}%)"
+            )
+        elif opposed:
+            pts -= 8
+        else:  # señal neutral: la ruptura en sí es la oportunidad
+            pts += 6
+            reasons.append(f"Ruptura de nivel {'al alza' if up else 'a la baja'} confirmada")
+
+    pattern = next((p for p in structure.get("patterns", []) if p.get("confirmed")), None)
+    if pattern:
+        p_long = pattern.get("direction") == "long"
+        aligned = (bullish and p_long) or (bearish and not p_long)
+        if aligned:
+            pts += 6
+            reasons.append(f"Patrón {pattern['pattern']} confirmado (neckline rota)")
+        elif bullish or bearish:
+            pts -= 6
+    else:
+        bounce = next((p for p in structure.get("patterns", []) if p.get("bounce_valid")), None)
+        if bounce:
+            b_long = bounce.get("direction") == "long"
+            if (bullish and b_long) or (bearish and not b_long):
+                pts += 4
+                reasons.append(f"Rebote en 2a pata de {bounce['pattern']} (pre-ruptura)")
+
+    sup = structure.get("nearest_support") or {}
+    res = structure.get("nearest_resistance") or {}
+    if bullish and sup and float(sup.get("distance_pct", 999.0)) <= 1.0:
+        pts += 5
+        reasons.append(f"Precio sobre soporte de {sup.get('touches', 0)} toques ({sup['distance_pct']:.2f}%)")
+    elif bearish and res and float(res.get("distance_pct", 999.0)) <= 1.0:
+        pts += 5
+        reasons.append(f"Precio bajo resistencia de {res.get('touches', 0)} toques ({res['distance_pct']:.2f}%)")
+
+    return max(-8, min(15, pts)), reasons
+
+
 def _risk_penalty(
     signal: str,
     funding: float,
@@ -661,6 +725,7 @@ def calculate_opportunity_score(
     # Kept for backwards compat — no longer used in scoring
     volume_24h: float = 0.0,
     multi_exchange_data: Optional[Dict[str, Any]] = None,
+    structure: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     flow_pts, flow_r = _flow_score(signal, metrics, imbalance, liquidation_summary)
     tech_pts, tech_r = _technical_score(technical, signal)
@@ -669,12 +734,13 @@ def calculate_opportunity_score(
     fut_pts, fut_r = _futures_score(signal, funding, open_interest, liquidation_summary, oi_change_pct)
     gex_pts, gex_r = _gex_score(gex_data, signal, price)
     bk_pts, bk_r  = _breakout_score(technical, metrics, signal)
+    st_pts, st_r  = _structure_score(structure, signal)
     mx_pts, mx_r  = _multi_exchange_score(multi_exchange_data, signal)
     penalty, warnings = _risk_penalty(signal, funding, spread_pct, technical, breakout_pts=bk_pts, metrics=metrics)
 
-    raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts + mx_pts - penalty
+    raw = flow_pts + tech_pts + vp_pts + fp_pts + fut_pts + gex_pts + bk_pts + st_pts + mx_pts - penalty
     score = max(0, min(100, raw))
-    reasons = (flow_r + tech_r + vp_r + fp_r + fut_r + gex_r + bk_r + mx_r)[:8]
+    reasons = (st_r + flow_r + tech_r + vp_r + fp_r + fut_r + gex_r + bk_r + mx_r)[:8]
 
     return {
         "score": score,
@@ -685,6 +751,7 @@ def calculate_opportunity_score(
         "futures_score": fut_pts,
         "gex_score": gex_pts,
         "breakout_score": bk_pts,
+        "structure_score": st_pts,
         "multi_exchange_score": mx_pts,
         "risk_penalty": penalty,
         "reasons": reasons,

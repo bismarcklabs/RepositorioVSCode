@@ -88,7 +88,7 @@ class KuCoinProvider:
         Retorna: price (last trade), bestBid, bestAsk, size, time
         Volumen 24h: GET /api/v1/market/stats?symbol=BTC-USDT → vol field
         """
-        l1 = _fetch("/api/v1/market/orderbook/level1", {"symbol": symbol}, ttl=8.0)
+        l1 = _fetch("/api/v1/market/orderbook/level1", {"symbol": symbol}, ttl=25.0)
         if not l1 or "price" not in l1:
             return _failed_ticker(self.name, symbol, normalized_symbol,
                                   "no data" if not l1 else "missing price")

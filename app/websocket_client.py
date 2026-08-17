@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections import deque
 from typing import Any, Dict, List, Optional
 
@@ -10,7 +11,11 @@ import websockets
 from app.market_scanner import get_top_symbols
 
 trade_store: Dict[str, deque] = {}
+_symbol_last_seen: Dict[str, float] = {}
 _trade_lock = threading.Lock()
+
+# Símbolos sin trades en este tiempo (y fuera del stream actual) se eliminan
+_PRUNE_INACTIVE_SECONDS = 300.0
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,6 +74,27 @@ async def process_message(message: str) -> None:
         if symbol not in trade_store:
             trade_store[symbol] = deque(maxlen=1000)
         trade_store[symbol].append(trade)
+        _symbol_last_seen[symbol] = time.monotonic()
+
+
+def prune_inactive_symbols() -> int:
+    """Elimina de trade_store los símbolos fuera del stream actual y sin
+    trades recientes. Evita crecimiento monótono del dict cuando los
+    símbolos suscritos rotan. Retorna cuántos se eliminaron."""
+    now = time.monotonic()
+    active = set(_get_stream_symbols())
+    with _trade_lock:
+        stale = [
+            sym for sym in trade_store
+            if sym not in active
+            and now - _symbol_last_seen.get(sym, 0.0) > _PRUNE_INACTIVE_SECONDS
+        ]
+        for sym in stale:
+            del trade_store[sym]
+            _symbol_last_seen.pop(sym, None)
+    if stale:
+        logger.info("WS PRUNE: %d símbolos inactivos eliminados de trade_store", len(stale))
+    return len(stale)
 
 
 def get_trades_snapshot(symbol: str) -> List[Dict[str, Any]]:
@@ -79,6 +105,7 @@ def get_trades_snapshot(symbol: str) -> List[Dict[str, Any]]:
 
 
 async def stream_trades() -> None:
+    last_prune = time.monotonic()
     while True:
         # Resolver símbolos: configurados o fallback top-20 spot
         symbols = _get_stream_symbols()
@@ -112,10 +139,14 @@ async def stream_trades() -> None:
                         # Verificar si hay cambio de símbolos (threading.Event, no asyncio)
                         if _symbols_changed.is_set():
                             logger.info("Símbolos cambiados — reconectando WebSocket.")
+                            prune_inactive_symbols()
                             break
                     except (websockets.exceptions.ConnectionClosedError,
                             websockets.exceptions.ConnectionClosedOK):
                         break
+                    if time.monotonic() - last_prune >= _PRUNE_INACTIVE_SECONDS:
+                        prune_inactive_symbols()
+                        last_prune = time.monotonic()
 
         except (websockets.exceptions.ConnectionClosedError,
                 websockets.exceptions.ConnectionClosedOK) as exc:

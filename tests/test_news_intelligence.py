@@ -90,6 +90,38 @@ def test_does_not_match_ambiguous_ticker_as_common_word():
     assert _matches_symbol("ZECUSDT", "Zcash Orchard vulnerability remediated")
 
 
+def test_one_letter_ticker_needs_explicit_notation():
+    # Falsos positivos reales del diagnóstico 2026-07-17: "A" matcheaba todo
+    assert not _matches_symbol("AUSDT", "A Guide to Crypto Wallets for Beginners")
+    assert not _matches_symbol("AUSDT", "More Than Bitcoin: 5 Types of Crypto Projects Explained Simply")
+    assert not _matches_symbol("TUSDT", "Inside Bonzo Lend's $9M exploit - why secure smart contracts couldn't stop it")
+    # Con notación explícita sí
+    assert _matches_symbol("AUSDT", "$A rallies 20% after exchange listing")
+    assert _matches_symbol("AUSDT", "AUSDT volume spikes on Binance")
+    assert _matches_symbol("TUSDT", "T/USDT breaks resistance")
+
+
+def test_english_word_tickers_need_crypto_evidence():
+    # Falsos positivos reales: POWER (Anker), TRUMP (política), BEAT, HYPE, SAMSUNG
+    assert not _matches_symbol("POWERUSDT", "This Compact Anker Portable Power Station Is 50% Off Right Now")
+    assert not _matches_symbol("POWERUSDT", "Severe storms down power lines across Hackensack")
+    assert not _matches_symbol("TRUMPUSDT", "Trump blames vandals for Reflecting Pool problems")
+    assert not _matches_symbol("BEATUSDT", "Hacks and The Comeback Beat the Odds - Filmmaker Magazine")
+    assert not _matches_symbol("HYPEUSDT", "Hackers are capitalizing on AI hype to ramp up social engineering attacks")
+    assert not _matches_symbol("SAMSUNGUSDT", "Samsung Galaxy Z Fold 8 Price Leak Reveals Ultra Tier")
+    # Con evidencia cripto explícita sí
+    assert _matches_symbol("POWERUSDT", "$POWER surges after Aragon DAO exploit recovery")
+    assert _matches_symbol("POWERUSDT", "Attacker cleans out $1.6M from POWER in Aragon DAO exploit, token crashes")
+    assert _matches_symbol("HYPEUSDT", "HYPE token hits new all-time high")
+    assert _matches_symbol("TRUMPUSDT", "TRUMP coin crashes 30% after unlock")
+
+
+def test_uppercase_ticker_requires_crypto_context():
+    # MAYÚSCULAS sin contexto cripto no basta (siglas de otra industria)
+    assert not _matches_symbol("POWERUSDT", "POWER outage hits the East Coast grid")
+    assert _matches_symbol("POWERUSDT", "POWER leads token gainers on DeFi exchange")
+
+
 def test_aggregate_marks_contradictory_news():
     positive = score_event({
         "symbol": "HOMEUSDT",

@@ -60,11 +60,16 @@ def calculate_entry_exit(
     technical: Dict[str, Any],
     volume_profile: Optional[Dict[str, Any]],
     gex_data: Optional[Dict[str, Any]],
+    structure: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Calcula timing, entrada, stop y TPs para una acción dada.
 
     Retorna None si no es posible construir un setup mínimo válido
     (entry > 0, stop > 0, stop != entry, TP1 > 0).
+
+    `structure` (opcional): salida de structure_levels.analyze_structure — sus
+    niveles S/R entran como candidatos de pullback, stop y take profit junto a
+    VWAP/VP/GEX.
     """
     if price <= 0.0 or action not in ("BUY_SPOT", "LONG_FUTURES", "SHORT_FUTURES", "SELL_SPOT"):
         return None
@@ -82,18 +87,23 @@ def calculate_entry_exit(
     put_wall = (gex_data or {}).get("put_wall", 0.0)
     gamma_flip = (gex_data or {}).get("gamma_flip", 0.0)
 
+    struct_levels: List[float] = [
+        float(lv["price"]) for lv in (structure or {}).get("levels", [])
+        if lv.get("price")
+    ]
+
     if action in ("BUY_SPOT", "LONG_FUTURES"):
         return _build_long(
             action, price, vwap, vwap_dist_pct, above_vwap,
             poc, hvn_levels, lvn_levels, put_wall, call_wall, gamma_flip,
-            atr=atr,
+            atr=atr, struct_levels=struct_levels,
         )
 
     if action in ("SHORT_FUTURES", "SELL_SPOT"):
         return _build_short(
             action, price, vwap, vwap_dist_pct, above_vwap,
             poc, hvn_levels, lvn_levels, call_wall, put_wall, gamma_flip,
-            atr=atr,
+            atr=atr, struct_levels=struct_levels,
         )
 
     return None
@@ -114,7 +124,9 @@ def _build_long(
     call_wall: float,
     gamma_flip: float,
     atr: float = 0.0,
+    struct_levels: Optional[List[float]] = None,
 ) -> Optional[Dict[str, Any]]:
+    struct_levels = struct_levels or []
 
     # ── Timing ──────────────────────────────────────────────────────────────
     # NOW: precio sobre VWAP y a ≤ 0.8% de él
@@ -125,10 +137,10 @@ def _build_long(
         entry_high = price * 1.001
         entry = price
     elif above_vwap and abs(vwap_dist_pct) > 0.8:
-        # Precio extendido sobre VWAP — esperar pullback a VWAP / POC / HVN
+        # Precio extendido sobre VWAP — esperar pullback a VWAP / POC / HVN / S-R
         timing = "WAIT_FOR_PULLBACK"
         entry_type = "pullback"
-        pullback_target = _best_pullback_support(price, vwap, poc, hvn_levels, put_wall)
+        pullback_target = _best_pullback_support(price, vwap, poc, hvn_levels, put_wall, struct_levels)
         if pullback_target <= 0.0:
             return None
         entry = pullback_target
@@ -147,7 +159,8 @@ def _build_long(
 
     # ── Stop loss ────────────────────────────────────────────────────────────
     min_sl = _MIN_SL_PCT_SPOT if action == "BUY_SPOT" else _MIN_SL_PCT_FUTURES
-    stop = _long_stop(entry, vwap, poc, hvn_levels, lvn_levels, put_wall, atr=atr, min_sl_pct=min_sl)
+    stop = _long_stop(entry, vwap, poc, hvn_levels, lvn_levels, put_wall,
+                      atr=atr, min_sl_pct=min_sl, struct_levels=struct_levels)
     if stop <= 0.0 or stop >= entry:
         return None
 
@@ -169,6 +182,9 @@ def _build_long(
         tp1_candidates.append(nearest_hvn_above)
     if poc > entry:
         tp1_candidates.append(poc)
+    nearest_struct_above = _nearest_above(entry, struct_levels)
+    if nearest_struct_above:
+        tp1_candidates.append(nearest_struct_above)
 
     tp1 = min(tp1_candidates) if tp1_candidates else min_tp1
     tp1 = max(tp1, min_tp1)   # nunca menos de 1.5R
@@ -179,6 +195,9 @@ def _build_long(
     hvn_above_tp1 = [l for l in hvn_levels if l > tp1]
     if hvn_above_tp1:
         tp2_candidates.append(min(hvn_above_tp1))
+    struct_above_tp1 = [l for l in struct_levels if l > tp1]
+    if struct_above_tp1:
+        tp2_candidates.append(min(struct_above_tp1))
 
     tp2 = min(tp2_candidates) if tp2_candidates else min_tp2
     tp2 = max(tp2, min_tp2)
@@ -212,6 +231,7 @@ def _best_pullback_support(
     poc: float,
     hvn_levels: List[float],
     put_wall: float,
+    struct_levels: Optional[List[float]] = None,
 ) -> float:
     candidates = []
     if vwap > 0.0 and vwap < price:
@@ -223,6 +243,9 @@ def _best_pullback_support(
         candidates.append(poc)
     if put_wall > 0.0 and put_wall < price:
         candidates.append(put_wall)
+    struct_below = [l for l in (struct_levels or []) if l < price]
+    if struct_below:
+        candidates.append(max(struct_below))
     return max(candidates) if candidates else 0.0
 
 
@@ -235,6 +258,7 @@ def _long_stop(
     put_wall: float,
     atr: float = 0.0,
     min_sl_pct: float = _MIN_SL_PCT_FUTURES,
+    struct_levels: Optional[List[float]] = None,
 ) -> float:
     candidates = []
     if vwap > 0.0 and vwap < entry:
@@ -246,6 +270,9 @@ def _long_stop(
         candidates.append(poc * 0.997)
     if put_wall > 0.0 and put_wall < entry:
         candidates.append(put_wall * 0.997)
+    struct_below = [l for l in (struct_levels or []) if l < entry]
+    if struct_below:
+        candidates.append(max(struct_below) * 0.997)   # bajo el soporte estructural
     if atr > 0.0:
         candidates.append(entry - 1.5 * atr)
     else:
@@ -298,7 +325,9 @@ def _build_short(
     put_wall: float,
     gamma_flip: float,
     atr: float = 0.0,
+    struct_levels: Optional[List[float]] = None,
 ) -> Optional[Dict[str, Any]]:
+    struct_levels = struct_levels or []
 
     # ── Timing ──────────────────────────────────────────────────────────────
     if not above_vwap and abs(vwap_dist_pct) <= 0.8:
@@ -308,10 +337,10 @@ def _build_short(
         entry_low = price * 0.999
         entry_high = price * 1.001
     elif not above_vwap and abs(vwap_dist_pct) > 0.8:
-        # Precio muy extendido bajo VWAP — esperar pullback a VWAP / POC / HVN
+        # Precio muy extendido bajo VWAP — esperar pullback a VWAP / POC / HVN / S-R
         timing = "WAIT_FOR_PULLBACK"
         entry_type = "pullback"
-        pullback_target = _best_pullback_resistance(price, vwap, poc, hvn_levels, call_wall)
+        pullback_target = _best_pullback_resistance(price, vwap, poc, hvn_levels, call_wall, struct_levels)
         if pullback_target <= 0.0:
             return None
         entry = pullback_target
@@ -329,7 +358,8 @@ def _build_short(
 
     # ── Stop loss ────────────────────────────────────────────────────────────
     min_sl = _MIN_SL_PCT_SPOT if action == "SELL_SPOT" else _MIN_SL_PCT_FUTURES
-    stop = _short_stop(entry, vwap, poc, hvn_levels, call_wall, atr=atr, min_sl_pct=min_sl)
+    stop = _short_stop(entry, vwap, poc, hvn_levels, call_wall,
+                       atr=atr, min_sl_pct=min_sl, struct_levels=struct_levels)
     if stop <= 0.0 or stop <= entry:
         return None
 
@@ -351,6 +381,9 @@ def _build_short(
         tp1_candidates.append(nearest_hvn_below)
     if poc > 0.0 and poc < entry:
         tp1_candidates.append(poc)
+    nearest_struct_below = _nearest_below(entry, struct_levels)
+    if nearest_struct_below:
+        tp1_candidates.append(nearest_struct_below)
 
     tp1 = max(tp1_candidates) if tp1_candidates else min_tp1
     tp1 = min(tp1, min_tp1)   # para shorts, tp1 más bajo = más reward; min() lo hace más agresivo
@@ -361,6 +394,9 @@ def _build_short(
     hvn_below_tp1 = [l for l in hvn_levels if l < tp1]
     if hvn_below_tp1:
         tp2_candidates.append(max(hvn_below_tp1))
+    struct_below_tp1 = [l for l in struct_levels if l < tp1]
+    if struct_below_tp1:
+        tp2_candidates.append(max(struct_below_tp1))
 
     tp2 = max(tp2_candidates) if tp2_candidates else min_tp2
     tp2 = min(tp2, min_tp2)
@@ -394,6 +430,7 @@ def _best_pullback_resistance(
     poc: float,
     hvn_levels: List[float],
     call_wall: float,
+    struct_levels: Optional[List[float]] = None,
 ) -> float:
     candidates = []
     if vwap > 0.0 and vwap > price:
@@ -405,6 +442,9 @@ def _best_pullback_resistance(
         candidates.append(poc)
     if call_wall > 0.0 and call_wall > price:
         candidates.append(call_wall)
+    struct_above = [l for l in (struct_levels or []) if l > price]
+    if struct_above:
+        candidates.append(min(struct_above))
     return min(candidates) if candidates else 0.0
 
 
@@ -416,6 +456,7 @@ def _short_stop(
     call_wall: float,
     atr: float = 0.0,
     min_sl_pct: float = _MIN_SL_PCT_FUTURES,
+    struct_levels: Optional[List[float]] = None,
 ) -> float:
     candidates = []
     if vwap > 0.0 and vwap > entry:
@@ -427,6 +468,9 @@ def _short_stop(
         candidates.append(poc * 1.003)
     if call_wall > 0.0 and call_wall > entry:
         candidates.append(call_wall * 1.003)
+    struct_above = [l for l in (struct_levels or []) if l > entry]
+    if struct_above:
+        candidates.append(min(struct_above) * 1.003)   # sobre la resistencia estructural
     if atr > 0.0:
         candidates.append(entry + 1.5 * atr)
     else:

@@ -75,16 +75,29 @@ def _elapsed_hours(open_time_iso: str) -> float:
         return 0.0
 
 
-def _fetch_prices(positions: List[Dict]) -> Dict[str, float]:
-    """Obtiene el precio actual de cada símbolo en batch."""
+def _fetch_prices(
+    positions: List[Dict],
+    scanned_prices: Optional[Dict[str, Dict[str, float]]] = None,
+) -> Dict[str, float]:
+    """Obtiene el precio actual de cada símbolo en batch.
+
+    Si scanned_prices trae el símbolo (ya calculado por _scan_symbol en este
+    mismo ciclo), lo reusa en vez de volver a pedirlo a Binance.
+    """
     prices: Dict[str, float] = {}
     for pos in positions:
         sym = pos["symbol"]
         if sym in prices:
             continue
+        is_futures = "FUTURES" in pos["action"]
+        if scanned_prices and sym in scanned_prices:
+            p = scanned_prices[sym].get("futures" if is_futures else "spot")
+            if p:
+                prices[sym] = p
+                continue
         try:
             p = (market_data.get_futures_price(sym)
-                 if "FUTURES" in pos["action"]
+                 if is_futures
                  else market_data.get_spot_price(sym))
             if p:
                 prices[sym] = p
@@ -146,8 +159,13 @@ def _close_kucoin_position(pos: Dict, price: float) -> None:
 
 # ── TP/SL checker ─────────────────────────────────────────────────────────
 
-def check_positions() -> None:
-    """Verifica TP1/TP2/SL/timeout para todas las posiciones abiertas."""
+def check_positions(scanned_prices: Optional[Dict[str, Dict[str, float]]] = None) -> None:
+    """Verifica TP1/TP2/SL/timeout para todas las posiciones abiertas.
+
+    scanned_prices: {symbol: {"spot": ..., "futures": ...}} ya calculados por
+    _scan_symbol en el ciclo actual — evita refetch para símbolos que estén
+    entre los candidatos ya escaneados.
+    """
     if not AUTO_TRADING_ENABLED:
         return
 
@@ -155,7 +173,7 @@ def check_positions() -> None:
     if not positions:
         return
 
-    prices = _fetch_prices(positions)
+    prices = _fetch_prices(positions, scanned_prices)
 
     for pos in positions:
         sym   = pos["symbol"]
@@ -261,7 +279,7 @@ def check_positions() -> None:
                     _close_kucoin_position(pos, price)
                     database.close_auto_position(
                         pos["id"], price, "tp1_only",
-                        pnl2["open_pnl_usdt"], tp1_pnl_usdt, round(tp1_pnl_usdt / size * 100, 2),
+                        pnl2["open_pnl_usdt"], pnl2["total_pnl_usdt"], pnl2["total_pnl_pct"],
                     )
                     logger.info("AUTO TP1_ONLY %s %s | sin TP2 → cerrado", action, sym)
 
@@ -578,7 +596,7 @@ def recover_gap_positions() -> None:
                     pnl = calc_pnl(pos_state, tp1)
                     database.close_auto_position(
                         pos["id"], tp1, "tp1_only",
-                        pnl["open_pnl_usdt"], tp1_pnl_usdt, round(tp1_pnl_usdt / size * 100, 2),
+                        pnl["open_pnl_usdt"], pnl["total_pnl_usdt"], pnl["total_pnl_pct"],
                     )
                     _notify_close(pos, tp1, "tp1_only", pnl)
                     closed = True

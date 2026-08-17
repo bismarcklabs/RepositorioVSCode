@@ -10,6 +10,18 @@ Presenta todos los resultados en tablas markdown. Usa ⚠️ para advertencias y
 
 ---
 
+## 0. Histórico de diagnósticos (leer ANTES de ejecutar el análisis)
+
+Los diagnósticos anteriores viven en `outputs/diagnosticos/YYYY-MM-DD.md`. Cada archivo termina con un bloque `## Métricas clave (JSON — para comparación automática entre diagnósticos)` con las cifras del run.
+
+Antes de correr el script:
+1. Lista `outputs/diagnosticos/*.md` y lee el **más reciente** (si existe alguno además del de hoy).
+2. Extrae su bloque JSON de métricas clave.
+
+En el informe, incluye una sección **"Comparativa con el diagnóstico anterior (fecha)"** con los deltas contra ese JSON: WR ajustado post por acción, WR ajustado por grado (A/B/NO_TRADE), slippage SL paper, WR direccional micro 72h, accuracy de noticias, y — si el JSON previo trae la clave `estructura` — WR ajustado por ruta chartista, retorno forward de setups 3m y WR del micro por niveles vs momentum. Marca con ✅ las métricas que mejoran y con ⚠️ las que se deterioran >2 pp. Si no hay histórico previo, indícalo y omite la sección.
+
+---
+
 ## 1. Estado del scanner y cobertura del grado calibrado
 
 - Fecha del último registro en `trade_alerts`, `micro_scalp_alerts` y `market_snapshots`
@@ -57,6 +69,38 @@ Hipótesis a validar: **¿el grado A tiene mayor WR que B, y B mayor que C?** Ev
 
 ---
 
+## 3b. Estrategia de estructura: rutas chartistas, setups 3m y micro por niveles
+
+Fecha de activación: `RESTART_STRUCT = '2026-07-18'` (primer despliegue de `level_breakout`/`pattern_break`/`structure_json`). Si existen alertas con `setup_route='level_breakout'`, usar `MIN(timestamp)` de esas como fecha real y reportarla. Si el scanner aún no se ha reiniciado con este código, indicarlo y omitir las tablas vacías.
+
+### 3b-i. WR por ruta de setup (chartista vs flujo)
+
+Sobre el dataset de §2 (alertas + outcomes 60m), agrupar por `setup_route` de `trade_alerts` (`level_breakout`, `pattern_break`, `classic_trigger`, `momentum_continuation`, `none`/vacío):
+- n, evaluadas, **WR oficial**, **WR ajustado** (R=0.5, ver §2), retorno promedio
+- Desglose por `trigger_type` para las rutas nuevas (`level_breakout_up/down`, `*_break`)
+
+**Hipótesis**: ¿las rutas chartistas superan a `classic_trigger`/`momentum_continuation` en WR ajustado? ⚠️ Marcar muestra pequeña si evaluadas < 20 por ruta — no concluir con menos.
+
+### 3b-ii. Setups de estructura 3m (los del panel del dashboard)
+
+De `market_snapshots` WHERE `structure_json != '{}'` (columna creada 2026-07-18):
+- Cobertura: n filas con estructura, rango de fechas, % sobre el total del período
+- Conteo de señales: breakouts confirmados (up/down), patrones confirmados por tipo (`head_and_shoulders`, `double_top`, etc.), patrones en formación
+- **Confirmación de flujo** (los mismos 4 checks del panel, con las columnas de la misma fila): delta alineado, cvd_15m alineado, |imbalance| ≥ 0.08 alineado, relative_volume ≥ 1.5 — distribución de checks (0-4) entre los setups confirmados
+- **Rendimiento forward aproximado (DB-only)**: por cada snapshot con breakout o patrón confirmado, buscar el siguiente snapshot del MISMO símbolo con timestamp ≥ +55 min y calcular retorno con signo según la dirección de la señal (`(precio_fwd − precio)/precio × dir`). Reportar n medibles, retorno promedio, % positivo — separado por tipo de señal y dirección, y también segmentado por checks de flujo (0-2 vs 3-4) para validar si la confirmación por órdenes/volumen discrimina. Indicar cuántas señales quedaron sin snapshot posterior (excluidas).
+- ⚠️ Es aproximación: los snapshots solo existen con `score >= SNAPSHOT_MIN_SCORE` y el forward depende de que el símbolo re-aparezca — tratar como tendencia, no como WR exacto.
+
+### 3b-iii. Micro-scalp: método por niveles vs momentum puro
+
+De `micro_scalp_alerts` con `timestamp >= RESTART_STRUCT`, clasificar por `reasons_json`:
+- **nivel**: contiene "Rebote en soporte" o "Rechazo en resistencia"
+- **momentum**: el resto
+
+Comparar por grupo (y por acción): n, WR direccional, PnL promedio, MFE/MAE promedio.
+**Hipótesis**: ¿el método de rebote en nivel mejora el WR direccional del micro-scalp (base histórica: 24-30%)?
+
+---
+
 ## 4. Análisis de posiciones paper: impacto del SL fix
 
 Separar `auto_positions` cerradas (mode='paper') en **antes y después del restart**:
@@ -92,6 +136,8 @@ Por acción (`MICRO_LONG_SCALP`, `MICRO_SHORT_SCALP`):
 ---
 
 ## 6. Módulo de noticias: accuracy y correlación con alertas
+
+⚠️ **Nota**: el 2026-07-18 se purgó TODO el histórico de noticias (matching por substring corregido — ver HANDOFF §0i). Solo evaluar datos con `timestamp >= '2026-07-18'`; no comparar accuracy con diagnósticos previos a esa fecha. Si hay pocas predicciones resueltas, reportar "recolectando datos" en vez de conclusiones.
 
 ### 6a. Accuracy de predicciones de noticias
 
@@ -158,7 +204,44 @@ Presenta un único bloque de conclusiones combinando ambos análisis:
 - **¿El grado calibrado A/B discrimina mejor que C/NO_TRADE?** (sí/no + dato)
 - **¿El SL fix redujo las pérdidas ficticias en paper?** (sí/no + cuánto)
 - **¿El micro-scalping tiene asimetría R:R negativa?** (advertencia si WR>50% pero PnL<0)
-- **¿Las noticias predicen algo útil?** (accuracy BULLISH/BEARISH + ¿hay diferencia de WR entre alineadas y contrarias?)
+- **¿Las rutas chartistas rinden mejor que las de flujo?** (WR ajustado de `level_breakout`/`pattern_break` vs `classic_trigger`/`momentum_continuation`, con n)
+- **¿El timeframe 3m de estructura muestra edge?** (retorno forward de setups confirmados por checks de flujo 3-4 vs 0-2, y micro por niveles vs momentum)
+- **¿Las noticias predicen algo útil?** (accuracy BULLISH/BEARISH + ¿hay diferencia de WR entre alineadas y contrarias?; solo datos post-purga 2026-07-18)
 - **¿Qué hora UTC tiene el mayor WR y retorno, y qué bloque es mejor/peor para micro-scalp?** (incluir equivalencia en hora México, UTC-6)
 - **Comportamiento en la apertura de Wall Street (13:30-15:30 UTC)**
+- **¿Qué cambió desde el diagnóstico anterior?** (resumen de la comparativa de la sección 0; omitir si no hay histórico)
 - **Próximos pasos sugeridos** (máximo 3 puntos concisos)
+
+---
+
+## 9. Persistencia del diagnóstico (paso final obligatorio)
+
+Guarda el informe completo en `outputs/diagnosticos/YYYY-MM-DD.md` (fecha de hoy; sobrescribir si ya existe uno del mismo día). El archivo debe:
+
+- Empezar con un encabezado que incluya la fecha, el valor de RESTART y el último timestamp de `trade_alerts`.
+- Contener todas las secciones y tablas del informe.
+- Terminar con un bloque de código JSON bajo el encabezado exacto `## Métricas clave (JSON — para comparación automática entre diagnósticos)` con esta estructura (es la que leerán los diagnósticos futuros — mantener claves estables):
+
+```json
+{
+  "fecha": "YYYY-MM-DD",
+  "restart": "...",
+  "cobertura_grado_pct": 0.0,
+  "total_alertas": 0,
+  "wr_post": {"<ACCION>": {"n_eval": 0, "wr_oficial": 0.0, "wr_ajustado": 0.0, "pct_loss": 0.0, "ret_avg": 0.0}},
+  "wr_por_grado_ajustado": {"A": 0.0, "B": 0.0, "C": 0.0, "NO_TRADE": 0.0},
+  "n_por_grado": {"A": 0, "B": 0, "C": 0, "NO_TRADE": 0},
+  "paper": {"sl_slippage_pp_post": 0.0, "sl_n_post": 0, "sl_avg_pct_post": 0.0, "pnl_neto_post_usdt": 0.0, "hard_cap_n": 0},
+  "micro_72h": {"<ACCION>": {"n": 0, "wr_dir": 0.0, "pnl_avg": 0.0, "mfe": 0.0, "mae": 0.0}},
+  "estructura": {
+    "restart_struct": "2026-07-18",
+    "por_ruta": {"<RUTA>": {"n_eval": 0, "wr_oficial": 0.0, "wr_ajustado": 0.0, "ret_avg": 0.0}},
+    "setups_3m": {"n_confirmados": 0, "n_forward_medibles": 0, "ret_fwd_avg": 0.0, "pct_positivo": 0.0,
+                  "ret_fwd_flujo_alto": 0.0, "ret_fwd_flujo_bajo": 0.0},
+    "micro_metodo": {"nivel": {"n": 0, "wr_dir": 0.0, "pnl_avg": 0.0},
+                     "momentum": {"n": 0, "wr_dir": 0.0, "pnl_avg": 0.0}}
+  },
+  "noticias": {"acc_bullish": 0.0, "acc_bearish": 0.0, "tasa_neutral": 0.0, "wr_alineada": 0.0, "wr_contraria": 0.0},
+  "sesiones": {"mejor_hora_wr": "", "mejor_hora_ret": "", "peor_hora_wr": "", "mejor_bloque_alertas": "", "mejor_bloque_micro": "", "peor_bloque_micro": ""}
+}
+```

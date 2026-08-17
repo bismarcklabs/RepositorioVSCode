@@ -128,7 +128,11 @@ def _evaluate_micro_alert(alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     else:
         pnl_pct = (entry - exit_price) / entry * 100.0
 
-    pnl_usdt = round(pnl_pct / 100.0 * MICRO_SCALP_TRADE_SIZE_USDT, 4)
+    # trade_size_usdt por alerta (metodo "nivel" usa un multiplicador mayor,
+    # ver micro_scalper.py) — cae al tamano fijo historico si la fila es
+    # anterior a la migracion 006 (columna vacia/0).
+    trade_size = float(alert.get("trade_size_usdt") or 0.0) or MICRO_SCALP_TRADE_SIZE_USDT
+    pnl_usdt = round(pnl_pct / 100.0 * trade_size, 4)
 
     return {
         "id": alert["id"],

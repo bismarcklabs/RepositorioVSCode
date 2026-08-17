@@ -134,6 +134,11 @@ def get_orderbook_raw(symbol: str, limit: int = 20) -> Dict:
     return data if isinstance(data, dict) else {"bids": [], "asks": []}
 
 
+_INTERVAL_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600,
+}
+
+
 def get_klines(
     symbol: str,
     interval: str = "1m",
@@ -146,6 +151,9 @@ def get_klines(
     Si se pasan start_time_ms/end_time_ms, obtiene una ventana historica exacta.
     Eso evita que los outcome trackers pierdan alertas antiguas al consultar solo
     las ultimas velas.
+
+    TTL proporcional al intervalo: una vela de 15m/1h no cambia cada 60s, asi que
+    cachearla con el mismo TTL que 1m solo genera fetches redundantes cada ciclo.
     """
     params: Dict[str, Any] = {
         "symbol": symbol.upper(),
@@ -157,10 +165,13 @@ def get_klines(
     if end_time_ms is not None:
         params["endTime"] = int(end_time_ms)
 
+    interval_secs = _INTERVAL_SECONDS.get(interval, 60)
+    ttl = 30.0 if interval_secs <= 60 else min(interval_secs / 2.0, 300.0)
+
     data = _fetch(
         f"{_FUTURES_BASE}/fapi/v1/klines",
         params=params,
-        ttl=30.0,
+        ttl=ttl,
     )
     return data if isinstance(data, list) else []
 
@@ -208,3 +219,17 @@ def get_long_short_ratio(symbol: str) -> Optional[Dict]:
     if isinstance(data, list) and data:
         return data[0]
     return None
+
+
+def get_open_interest_hist(symbol: str, period: str = "1h", limit: int = 25) -> List[Dict]:
+    """Serie historica de open interest por simbolo (no existe endpoint en
+    bloque para todos los pares — a diferencia de ticker/funding/orderbook,
+    esta llamada es una por simbolo). TTL 300s: el uso previsto es un barrido
+    de baja frecuencia (candidate_discovery.py, cada pocas horas), no el
+    ciclo normal del scanner."""
+    data = _fetch(
+        f"{_FUTURES_BASE}/futures/data/openInterestHist",
+        params={"symbol": symbol.upper(), "period": period, "limit": limit},
+        ttl=300.0,
+    )
+    return data if isinstance(data, list) else []

@@ -102,7 +102,7 @@ def test_no_ignition_trigger_when_nothing_changed():
     assert reason is None
 
 
-# ── _get_universe / scan_accumulation_candidates ────────────────────────────
+# ── get_extended_universe / scan_accumulation_candidates ────────────────────
 
 def test_get_universe_filters_volume_and_blacklist(monkeypatch):
     import app.accumulation_scanner as acc
@@ -117,7 +117,7 @@ def test_get_universe_filters_volume_and_blacklist(monkeypatch):
     monkeypatch.setattr(acc, "get_futures_ticker_all", lambda: tickers)
     monkeypatch.setattr(acc, "get_premium_index_all", lambda: [{"symbol": "ABCUSDT", "lastFundingRate": "0.0002"}])
 
-    universe = acc._get_universe(2_000_000)
+    universe = acc.get_extended_universe(2_000_000)
     symbols = {u["symbol"] for u in universe}
     assert symbols == {"ABCUSDT"}
     assert universe[0]["funding_rate"] == pytest.approx(0.0002)
@@ -155,8 +155,66 @@ def test_scan_accumulation_candidates_excludes_below_threshold(monkeypatch):
     )
     monkeypatch.setattr(acc, "get_klines", lambda symbol, interval="1d", limit=90: flat_klines)
 
-    candidates = acc.scan_accumulation_candidates(min_quote_vol=2_000_000, score_threshold=45)
+    candidates = acc.scan_accumulation_candidates(min_quote_vol=2_000_000, score_threshold=45, breakout_enabled=False)
     assert candidates == []
+
+
+# ── _classify_channel / canal volatility_breakout ────────────────────────────
+
+def test_classify_channel_coiling_takes_priority(monkeypatch):
+    from app.accumulation_scanner import _classify_channel
+    metrics = {"coiling_score": 60.0, "contraction_ratio": 0.15}
+    channel, score = _classify_channel(metrics, coiling_threshold=45, breakout_ratio=2.5)
+    assert channel == "coiling"
+    assert score == pytest.approx(60.0)
+
+
+def test_classify_channel_volatility_breakout_when_expanding():
+    from app.accumulation_scanner import _classify_channel
+    metrics = {"coiling_score": 10.0, "contraction_ratio": 3.0}
+    channel, score = _classify_channel(metrics, coiling_threshold=45, breakout_ratio=2.5)
+    assert channel == "volatility_breakout"
+    assert score > 0
+
+
+def test_classify_channel_none_when_neither_qualifies():
+    from app.accumulation_scanner import _classify_channel
+    metrics = {"coiling_score": 10.0, "contraction_ratio": 1.0}
+    assert _classify_channel(metrics, coiling_threshold=45, breakout_ratio=2.5) is None
+
+
+def test_classify_channel_breakout_disabled_returns_none():
+    from app.accumulation_scanner import _classify_channel
+    metrics = {"coiling_score": 10.0, "contraction_ratio": 5.0}
+    result = _classify_channel(metrics, coiling_threshold=45, breakout_ratio=2.5, breakout_enabled=False)
+    assert result is None
+
+
+def test_scan_accumulation_candidates_includes_volatility_breakout(monkeypatch):
+    import app.accumulation_scanner as acc
+
+    tickers = [{"symbol": "EXPUSDT", "quoteVolume": "3000000", "priceChangePercent": "5"}]
+    monkeypatch.setattr(acc, "get_futures_ticker_all", lambda: tickers)
+    monkeypatch.setattr(acc, "get_premium_index_all", lambda: [])
+
+    # Expansion: ATR reciente muy por encima del ATR base (contraction_ratio
+    # alto) pero SIN los bonos de coiling (cierre bajo su propia SMA50 y
+    # volumen reciente bajo) — para que quede claro que el canal se decide
+    # por contraction_ratio, no porque también cruce el umbral de coiling.
+    expanding_klines = _make_daily_klines(
+        n=90, base_high=101, base_low=99, base_close=100, volume=1000.0,
+        recent_high=140, recent_low=60, recent_close=70, recent_days=14,
+        recent_volume=200.0,
+    )
+    monkeypatch.setattr(acc, "get_klines", lambda symbol, interval="1d", limit=90: expanding_klines)
+
+    candidates = acc.scan_accumulation_candidates(
+        min_quote_vol=2_000_000, score_threshold=45, breakout_ratio=2.5, breakout_enabled=True,
+    )
+    assert len(candidates) == 1
+    assert candidates[0]["symbol"] == "EXPUSDT"
+    assert candidates[0]["channel"] == "volatility_breakout"
+    assert candidates[0]["channel_score"] > 0
 
 
 # ── DB layer (accumulation_watch table) ─────────────────────────────────────
@@ -273,3 +331,34 @@ def test_run_accumulation_scan_persists_candidates(fresh_db, monkeypatch):
     watch_map = fresh_db.get_accumulation_watch_map()
     assert "ABCUSDT" in watch_map
     assert watch_map["ABCUSDT"]["funding_at_watch"] == pytest.approx(0.0004)
+    assert watch_map["ABCUSDT"]["channel"] == "coiling"
+
+
+# ── channel/channel_score genericos (watchlist multi-canal) ─────────────────
+
+def test_upsert_defaults_to_coiling_channel(fresh_db):
+    fresh_db.upsert_accumulation_watch(_watch_payload(coiling_score=55.0))
+    entry = fresh_db.get_accumulation_watch_map()["ABCUSDT"]
+    assert entry["channel"] == "coiling"
+    assert entry["channel_score"] == pytest.approx(55.0)
+
+
+def test_upsert_stores_custom_channel_and_metrics(fresh_db):
+    fresh_db.upsert_accumulation_watch(_watch_payload(
+        symbol="FUNUSDT", channel="funding_extreme", channel_score=42.0,
+        metrics={"funding_rate": 0.0042},
+    ))
+    entry = fresh_db.get_accumulation_watch_map()["FUNUSDT"]
+    assert entry["channel"] == "funding_extreme"
+    assert entry["channel_score"] == pytest.approx(42.0)
+    assert '"funding_rate": 0.0042' in entry["metrics_json"]
+
+
+def test_watchlist_orders_by_channel_score_across_channels(fresh_db):
+    fresh_db.upsert_accumulation_watch(_watch_payload(
+        symbol="LOWUSDT", channel="coiling", channel_score=20.0,
+    ))
+    fresh_db.upsert_accumulation_watch(_watch_payload(
+        symbol="HIGHUSDT", channel="oi_acceleration", channel_score=90.0,
+    ))
+    assert fresh_db.get_accumulation_watchlist_symbols(10) == ["HIGHUSDT", "LOWUSDT"]

@@ -93,7 +93,7 @@ class KrakenProvider:
         Estructura resultado: {"XXBTZUSD": {"a": [ask, ...], "b": [bid, ...], "c": [last, ...], "v": [vol_today, vol_24h]}}
         """
         pair = _normalize_pair(symbol)
-        result = _fetch("/Ticker", params={"pair": pair}, ttl=8.0)
+        result = _fetch("/Ticker", params={"pair": pair}, ttl=25.0)
         if not result:
             return _failed_ticker(self.name, symbol, normalized_symbol, "no data")
         try:

@@ -183,9 +183,9 @@ def classify_news(title: str, summary: str = "", symbol: str = "") -> Dict[str, 
     # El titular describe el movimiento inmediato; el cuerpo aporta contexto
     # fundamental, pero no debe invertir una direccion clara del titular.
     score = fundamental_score + market_score
-    if market_score >= NEWS_MIN_ABS_SCORE and score < NEWS_MIN_ABS_SCORE:
+    if market_score >= NEWS_MIN_ABS_SCORE and -NEWS_MIN_ABS_SCORE < score < NEWS_MIN_ABS_SCORE:
         score = market_score
-    elif market_score <= -NEWS_MIN_ABS_SCORE and score > -NEWS_MIN_ABS_SCORE:
+    elif market_score <= -NEWS_MIN_ABS_SCORE and -NEWS_MIN_ABS_SCORE < score < NEWS_MIN_ABS_SCORE:
         score = market_score
 
     if score >= NEWS_MIN_ABS_SCORE:
@@ -204,21 +204,55 @@ def classify_news(title: str, summary: str = "", symbol: str = "") -> Dict[str, 
     }
 
 
+_CRYPTO_CONTEXT_WORDS = ("crypto", "token", "blockchain", "coin", "defi", "exchange", "onchain", "on-chain")
+
+
 def _matches_symbol(symbol: str, title: str, summary: str = "") -> bool:
+    """Asocia una noticia a un símbolo solo con evidencia explícita.
+
+    Jerarquía de reglas (cualquiera basta):
+      1. Alias del proyecto (word-boundary) — "zcash" → ZEC.
+      2. Notación de mercado: $POWER, POWER/USDT, POWERUSDT, POWER-USD.
+      3. Ticker en MAYÚSCULAS exactas + contexto cripto (solo len>=3): los
+         titulares en Title Case producen "Power", no "POWER" — es el filtro
+         contra tickers que son palabras comunes en inglés.
+      4. Bigrama cripto adyacente (solo len>=3): "power token", "hype coin".
+
+    Tickers de 1-2 letras (A, T, US, IN...) solo matchean por reglas 1-2 —
+    sin alias registrado ni notación explícita no hay asociación posible.
+    """
     base = _base_symbol(symbol)
+    if not base:
+        return False
     original_text = f" {title} {summary} "
     text = original_text.lower()
-    aliases = _ALIASES.get(base, ())
-    if any(alias.lower() in text for alias in aliases):
+    base_lower = base.lower()
+    base_esc = re.escape(base_lower)
+
+    # 1. Alias del proyecto (multi-palabra como frase; palabra sola con boundary)
+    for alias in _ALIASES.get(base, ()):
+        alias_lower = alias.lower()
+        if " " in alias_lower:
+            if alias_lower in text:
+                return True
+        elif re.search(rf"\b{re.escape(alias_lower)}\b", text):
+            return True
+
+    # 2. Notación de mercado explícita
+    if re.search(rf"(?:\${base_esc}|\b{base_esc}/usdt?\b|\b{base_esc}usdt?\b|\b{base_esc}-usdt?\b)", text):
         return True
-    if base in _AMBIGUOUS_SYMBOLS:
-        return bool(re.search(rf"\b{re.escape(base)}\b", original_text))
-    # Evita asociar símbolos cortos/ambiguos salvo que aparezcan con contexto cripto.
-    if len(base) < 4:
-        return bool(re.search(rf"\b{re.escape(base.lower())}\b", text)) and any(
-            word in text for word in ("crypto", "token", "blockchain", "coin")
-        )
-    return bool(re.search(rf"\b{re.escape(base.lower())}\b", text))
+
+    if len(base) < 3:
+        return False
+
+    # 3. Ticker en mayúsculas exactas + contexto cripto en el texto
+    if re.search(rf"\b{re.escape(base)}\b", original_text) and any(
+        word in text for word in _CRYPTO_CONTEXT_WORDS
+    ):
+        return True
+
+    # 4. Bigrama cripto inmediatamente después del ticker
+    return bool(re.search(rf"\b{base_esc}\s+(?:token|coin|price|crypto)\b", text))
 
 
 def fetch_gdelt_news_batch(symbols: Iterable[str]) -> List[Dict[str, Any]]:
@@ -228,12 +262,15 @@ def fetch_gdelt_news_batch(symbols: Iterable[str]) -> List[Dict[str, Any]]:
     terms: List[str] = []
     for symbol in tracked:
         base = _base_symbol(symbol)
-        aliases = _ALIASES.get(base, ()) or (base,)
-        terms.extend(f'"{alias}"' if " " in alias else alias for alias in aliases)
+        aliases = _ALIASES.get(base, ())
+        # Sin alias, el ticker pelado solo sirve como término si tiene >=3 letras
+        # ("A crypto" o "T crypto" traen puro ruido).
+        selected = aliases or ((base,) if len(base) >= 3 else ())
+        terms.extend(f'"{alias}"' if " " in alias else alias for alias in selected)
     if not terms:
         return []
 
-    query = f"({' OR '.join(terms)}) (crypto OR token OR blockchain)"
+    query = f"({' OR '.join(dict.fromkeys(terms))}) (crypto OR token OR blockchain)"
     articles: List[Dict[str, Any]] = []
     for attempt in range(2):
         try:
@@ -332,8 +369,10 @@ def fetch_google_news_batch(symbols: Iterable[str]) -> List[Dict[str, Any]]:
     for symbol in tracked:
         base = _base_symbol(symbol)
         aliases = _ALIASES.get(base, ())
-        # Para tickers ambiguos se consulta el nombre del proyecto, no el ticker.
-        selected = aliases or (() if base in _AMBIGUOUS_SYMBOLS else (base,))
+        # Para tickers ambiguos o cortos se consulta el nombre del proyecto, no el ticker.
+        selected = aliases or (
+            (base,) if len(base) >= 3 and base not in _AMBIGUOUS_SYMBOLS else ()
+        )
         terms.extend(f'"{term}"' if " " in term else term for term in selected)
     if not terms:
         return []

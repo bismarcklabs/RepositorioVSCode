@@ -1,5 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.market_data import get_klines
 
@@ -70,17 +70,24 @@ def _default_context(last_price: float = 0.0) -> Dict[str, Any]:
     }
 
 
-def get_technical_context(symbol: str) -> Dict[str, Any]:
+def get_technical_context(symbol: str, klines_1m: Optional[List] = None) -> Dict[str, Any]:
     """EMA20/50 (1m), VWAP, momentum, ATR(14) y tendencia horaria (1h) en paralelo.
 
     Formato de kline Binance:
     [openTime, open, high, low, close, baseVol, closeTime, quoteVol, ...]
+
+    Si el llamador ya tiene velas de 1m del mismo ciclo (ej. _scan_symbol), pasarlas
+    en klines_1m evita un segundo fetch idéntico a Binance.
     """
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_1m = ex.submit(get_klines, symbol, "1m", 60)
-        f_1h = ex.submit(get_klines, symbol, "1h", 50)
-        klines = f_1m.result()
-        klines_1h = f_1h.result()
+    if klines_1m is None:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_1m = ex.submit(get_klines, symbol, "1m", 60)
+            f_1h = ex.submit(get_klines, symbol, "1h", 50)
+            klines = f_1m.result()
+            klines_1h = f_1h.result()
+    else:
+        klines = klines_1m
+        klines_1h = get_klines(symbol, "1h", 50)
 
     if len(klines) < 20:
         return _default_context()

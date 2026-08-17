@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crypto_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-crypto}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-crypto_local}
+      POSTGRES_DB: ${PG_DB:-crypto_dashboard}
+    ports:
+      - "${PG_PORT:-5434}:5432"
+    volumes:
+      - crypto_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  crypto_pg_data:

@@ -190,6 +190,50 @@ def test_insert_multiple_snapshots(fresh_db):
     assert count == 2
 
 
+def test_insert_snapshot_batch_drops_low_score_without_protection(fresh_db):
+    low_score = _make_snapshot("LOWUSDT")
+    low_score["score_data"] = {"score": 5}
+    fresh_db.insert_snapshots_batch([low_score])
+    count = fresh_db._get_conn().execute(
+        "SELECT COUNT(*) FROM market_snapshots WHERE symbol='LOWUSDT'"
+    ).fetchone()[0]
+    assert count == 0
+
+
+def test_insert_snapshot_batch_keeps_low_score_when_protected(fresh_db):
+    """Un símbolo con posición real abierta no debe perder su delta de ese
+    ciclo aunque el score sea bajo — romperia cualquier reconstruccion de
+    CVD acumulado (ver docstring de insert_snapshots_batch)."""
+    low_score = _make_snapshot("LOWUSDT")
+    low_score["score_data"] = {"score": 5}
+    fresh_db.insert_snapshots_batch([low_score], protected_symbols={"LOWUSDT"})
+    row = fresh_db._get_conn().execute(
+        "SELECT delta FROM market_snapshots WHERE symbol='LOWUSDT'"
+    ).fetchone()
+    assert row is not None
+    assert row["delta"] == pytest.approx(10.0)
+
+
+def test_insert_snapshot_batch_protection_does_not_affect_other_symbols(fresh_db):
+    low_score_protected = _make_snapshot("PROTUSDT")
+    low_score_protected["score_data"] = {"score": 5}
+    low_score_unprotected = _make_snapshot("UNPROTUSDT")
+    low_score_unprotected["score_data"] = {"score": 5}
+    high_score = _make_snapshot("HIGHUSDT")
+    high_score["score_data"] = {"score": 90}
+
+    fresh_db.insert_snapshots_batch(
+        [low_score_protected, low_score_unprotected, high_score],
+        protected_symbols={"PROTUSDT"},
+    )
+    symbols = {
+        r["symbol"] for r in fresh_db._get_conn().execute(
+            "SELECT symbol FROM market_snapshots"
+        ).fetchall()
+    }
+    assert symbols == {"PROTUSDT", "HIGHUSDT"}
+
+
 def test_insert_trade_alert(fresh_db):
     alert_id = fresh_db.insert_trade_alert(_make_alert())
     assert isinstance(alert_id, int) and alert_id > 0
@@ -309,3 +353,50 @@ def test_get_news_dashboard_returns_latest_prediction_and_events(fresh_db):
     data = fresh_db.get_news_dashboard(since_hours=24)
     assert data["predictions"][0]["prediction"] == "BULLISH"
     assert data["events"][0]["title"] == event["title"]
+
+def test_structure_json_roundtrip(fresh_db):
+    import json
+    snap = _make_snapshot()
+    snap["structure_micro"] = {
+        "levels": [{"price": 100_500.0, "touches": 3, "strength": 38.5,
+                    "kinds": ["high"], "first_index": 4, "last_index": 20}],
+        "nearest_support": {"price": 99_000.0, "touches": 2, "strength": 25.0,
+                            "distance_pct": 1.0},
+        "nearest_resistance": None,
+        "breakout": {"direction": "up", "level": 100_500.0, "touches": 3,
+                     "candles_ago": 1, "margin_pct": 0.45, "confirmed": True,
+                     "rvol": 2.1, "strength": 38.5},
+        "patterns": [{"pattern": "double_bottom", "direction": "long",
+                      "confirmed": True, "neckline": 100_500.0,
+                      "extreme": 98_000.0, "target": 103_000.0,
+                      "distance_to_neckline_pct": 0.5}],
+        "range": {"high": 100_500.0, "low": 99_000.0, "width_pct": 1.49},
+    }
+    fresh_db.insert_snapshots_batch([snap])
+    rows = fresh_db.get_latest_snapshots(limit=5, max_age_seconds=600)
+    assert rows
+    struct = json.loads(rows[0]["structure_json"])
+    assert struct["breakout"]["confirmed"] is True
+    assert struct["breakout"]["direction"] == "up"
+    assert struct["patterns"][0]["pattern"] == "double_bottom"
+    assert struct["nearest_support"]["price"] == 99_000.0
+    # los niveles se compactan: sin metadatos internos
+    assert "first_index" not in struct["levels"][0]
+    assert struct["levels"][0]["touches"] == 3
+
+
+def test_structure_json_empty_when_missing(fresh_db):
+    import json
+    fresh_db.insert_snapshots_batch([_make_snapshot()])
+    rows = fresh_db.get_latest_snapshots(limit=5, max_age_seconds=600)
+    assert json.loads(rows[0]["structure_json"]) == {}
+
+
+def test_compact_structure_caps_levels():
+    import json, app.database as db
+    many = {"levels": [{"price": float(i), "touches": 2, "strength": 20.0}
+                       for i in range(12)],
+            "patterns": []}
+    compact = json.loads(db._compact_structure(many))
+    assert len(compact["levels"]) == 6
+    assert db._compact_structure(None) == "{}"

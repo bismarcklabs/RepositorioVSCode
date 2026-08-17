@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.market_data import get_agg_trades_raw
 from app.websocket_client import get_trades_snapshot
@@ -47,7 +47,7 @@ def _has_consecutive(bucket_indices: List[int], min_count: int) -> bool:
     return False
 
 
-def get_footprint(symbol: str) -> Dict[str, Any]:
+def get_footprint(symbol: str, trades: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Calcula footprint básico a partir de aggTrades del WebSocket (o REST fallback).
 
     Terminología Binance aggTrade:
@@ -61,11 +61,15 @@ def get_footprint(symbol: str) -> Dict[str, Any]:
                       (compradores absorbieron a los vendedores).
     - absorption_sell: presión compradora dominante pero el precio no subió
                        (vendedores absorbieron a los compradores).
+
+    Si el llamador ya resolvió los trades del ciclo (ws + fallback REST, ej.
+    _scan_symbol), pasarlos en `trades` evita repetir esa misma resolución aquí.
     """
-    trades = get_trades_snapshot(symbol)
-    if not trades:
-        raw = get_agg_trades_raw(symbol, limit=100)
-        trades = _normalize_rest_trades(raw)
+    if trades is None:
+        trades = get_trades_snapshot(symbol)
+        if not trades:
+            raw = get_agg_trades_raw(symbol, limit=100)
+            trades = _normalize_rest_trades(raw)
 
     if len(trades) < 10:
         return _default_footprint()
