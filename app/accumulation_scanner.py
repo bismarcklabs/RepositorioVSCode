@@ -9,21 +9,29 @@ una señal fuerte por sí sola — no requiere estar sobre la SMA50 (eso solo
 aporta un bono de tendencia).
 """
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional, Tuple
 
 from app import database
+from app.db import _iso_to_ts
 from app.config import (
+    ACCUMULATION_ATL_ZONE_BAND_PCT,
     ACCUMULATION_COILING_SCORE_THRESHOLD,
+    ACCUMULATION_DEEP_VALUE_ENABLED,
+    ACCUMULATION_DEEP_VALUE_REFRESH_HOURS,
     ACCUMULATION_FUNDING_DROP_THRESHOLD,
     ACCUMULATION_IGNITION_VOLUME_MULT,
     ACCUMULATION_MIN_QUOTE_VOLUME_USDT,
+    ACCUMULATION_STRUCTURAL_IGNITION_MIN_CVD_15M,
+    ACCUMULATION_STRUCTURAL_IGNITION_MIN_OB_IMBALANCE,
     ACCUMULATION_VOLATILITY_BREAKOUT_ENABLED,
     ACCUMULATION_VOLATILITY_BREAKOUT_RATIO,
     ACCUMULATION_WATCH_ENABLED,
     ACCUMULATION_WATCH_EXPIRE_HOURS,
     MIN_QUOTE_VOLUME_USDT,
 )
+from app.historical_cache import ensure_history, get_klines_df
 from app.market_data import get_futures_ticker_all, get_klines, get_premium_index_all
 from app.market_scanner import STABLECOIN_BLACKLIST
 
@@ -306,6 +314,12 @@ def run_accumulation_scan() -> List[Dict[str, Any]]:
         except Exception:
             logger.exception("[%s] error guardando accumulation_watch", c.get("symbol"))
 
+        if ACCUMULATION_DEEP_VALUE_ENABLED:
+            try:
+                _maybe_refresh_deep_value(c["symbol"])
+            except Exception:
+                logger.exception("[%s] error calculando deep value", c["symbol"])
+
     try:
         expired = database.expire_stale_accumulation_watch(ACCUMULATION_WATCH_EXPIRE_HOURS)
         if expired:
@@ -345,3 +359,110 @@ def check_ignition_trigger(
         return f"funding {funding_at_watch:.5f} -> {funding_now:.5f} (cruce hacia/bajo cero)"
 
     return None
+
+
+_MIN_DEEP_VALUE_KLINES = 10
+
+
+def compute_deep_value_metrics(symbol: str, source: str = "futures") -> Optional[Dict[str, Any]]:
+    """Backfillea (incremental, via historical_cache) el historico diario
+    completo del simbolo y calcula distancia al minimo historico real (ATL)
+    + dias consecutivos con el cierre dentro de una banda sobre ese ATL
+    (ACCUMULATION_ATL_ZONE_BAND_PCT).
+
+    Es la unica funcion de este modulo que dispara I/O de red por simbolo
+    fuera del universo por lotes — debe llamarse solo para simbolos ya
+    clasificados por un canal (ver _maybe_refresh_deep_value), nunca sobre
+    el universo extendido completo.
+    """
+    try:
+        ensure_history(symbol, "1d", source=source)
+        df = get_klines_df(symbol, "1d")
+    except Exception:
+        logger.debug("[%s] error en backfill historico para deep value", symbol)
+        return None
+    if df is None or df.empty or len(df) < _MIN_DEEP_VALUE_KLINES:
+        return None
+
+    atl_idx = df["low"].idxmin()
+    atl_price = float(df.loc[atl_idx, "low"])
+    if atl_price <= 0:
+        return None
+    atl_date = df.loc[atl_idx, "open_time"].strftime("%Y-%m-%d")
+    close = float(df["close"].iloc[-1])
+    dist_to_atl_pct = (close - atl_price) / atl_price * 100.0
+
+    zone_ceiling = atl_price * (1 + ACCUMULATION_ATL_ZONE_BAND_PCT / 100.0)
+    days_in_zone = 0
+    for close_i in reversed(df["close"].tolist()):
+        if close_i <= zone_ceiling:
+            days_in_zone += 1
+        else:
+            break
+
+    return {
+        "atl_price": atl_price,
+        "atl_date": atl_date,
+        "dist_to_atl_pct": round(dist_to_atl_pct, 4),
+        "days_in_atl_zone": days_in_zone,
+    }
+
+
+def _maybe_refresh_deep_value(symbol: str) -> None:
+    """Llama compute_deep_value_metrics solo si no se ha refrescado en las
+    ultimas ACCUMULATION_DEEP_VALUE_REFRESH_HOURS — el ATL no cambia de un
+    dia para otro salvo nuevo minimo, y 'dias en zona' tampoco necesita mas
+    resolucion que diaria."""
+    existing = database.get_accumulation_watch_row(symbol)
+    checked_at = (existing or {}).get("deep_value_checked_at")
+    if checked_at:
+        hours_since = (time.time() - _iso_to_ts(checked_at)) / 3600.0
+        if hours_since < ACCUMULATION_DEEP_VALUE_REFRESH_HOURS:
+            return
+    deep = compute_deep_value_metrics(symbol)
+    if deep:
+        database.update_accumulation_deep_value(symbol, deep)
+
+
+def check_structural_ignition_trigger(
+    watch_entry: Dict[str, Any],
+    result_row: Dict[str, Any],
+) -> Optional[str]:
+    """Ignición "fuerte": breakout de estructura confirmado (precio+RVOL, ver
+    structure_levels.py) alineado con CVD 15m y order flow (footprint u
+    orderbook) — la tesis de accumulation watch es long-only, solo evalúa
+    dirección "up".
+
+    Vía adicional a check_ignition_trigger() (RVOL/funding, más rápida pero
+    más ruidosa) — pensada para dar una razón de ignición de mayor confianza
+    cuando estructura, flujo de órdenes y delta acumulado coinciden.
+    """
+    structure = result_row.get("structure") or {}
+    breakout = structure.get("breakout") or {}
+    if not breakout.get("confirmed") or breakout.get("direction") != "up":
+        return None
+
+    metrics = result_row.get("metrics") or {}
+    cvd_15m = float(metrics.get("cvd_15m", 0.0) or 0.0)
+    if cvd_15m < ACCUMULATION_STRUCTURAL_IGNITION_MIN_CVD_15M:
+        return None
+
+    footprint = result_row.get("footprint") or {}
+    orderbook = result_row.get("orderbook") or {}
+    footprint_delta = float(footprint.get("footprint_delta", 0.0) or 0.0)
+    stacked_buy = bool(footprint.get("stacked_buy_imbalance", False))
+    ob_imbalance = float(orderbook.get("imbalance", 0.0) or 0.0)
+
+    flow_confirmed = (
+        footprint_delta > 0
+        or stacked_buy
+        or ob_imbalance >= ACCUMULATION_STRUCTURAL_IGNITION_MIN_OB_IMBALANCE
+    )
+    if not flow_confirmed:
+        return None
+
+    return (
+        f"structural_breakout_cvd_confirmed level={breakout.get('level', 0.0):.6g} "
+        f"margin={breakout.get('margin_pct', 0.0):.2f}% cvd_15m={cvd_15m:+.2f} "
+        f"ob_imbalance={ob_imbalance:+.2f}"
+    )

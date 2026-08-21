@@ -34,6 +34,7 @@ from app.config import (
     NEAR_MISS_THRESHOLD,
     MULTI_STRATEGY_ENABLED,
     MICRO_SCALP_TRADE_SIZE_USDT,
+    ACCUMULATION_WATCH_ENABLED,
 )
 from app import database
 from app.auto_trader import calc_pnl as _calc_pnl_auto
@@ -103,6 +104,18 @@ def _cached_strategy_symbol_states():
 @st.cache_data(ttl=30)
 def _cached_symbol_price_history(symbol: str, since_iso: str):
     return database.get_symbol_price_history(symbol, since_iso)
+
+@st.cache_data(ttl=30)
+def _cached_symbol_price_history_with_cvd(symbol: str, since_iso: str):
+    return database.get_symbol_price_history(symbol, since_iso, include_cvd_15m=True)
+
+@st.cache_data(ttl=60)
+def _cached_accumulation_watch_list(limit: int = 50):
+    return database.get_accumulation_watch_list(limit=limit)
+
+@st.cache_data(ttl=120)
+def _cached_latest_news_predictions(symbols: tuple):
+    return database.get_latest_news_predictions(list(symbols))
 
 @st.cache_data(ttl=15)
 def _cached_open_auto_positions():
@@ -820,6 +833,135 @@ if _forming:
             use_container_width=True,
             height=min(320, 60 + 35 * len(_df_forming)),
         )
+
+
+# ── Sección: Accumulation Watch (watchlist de acumulación profunda) ──────
+if ENABLE_DATABASE and ACCUMULATION_WATCH_ENABLED:
+    st.markdown("### 🌱 Accumulation Watch — watchlist de acumulación profunda")
+    st.caption(
+        "Tokens en fase de coiling/acumulación fuera del top de volumen, con "
+        "distancia al mínimo histórico real (ATL), tiempo en zona, contexto de "
+        "noticias (informativo, no descarta candidatos) y confirmación de "
+        "ignición por estructura + CVD + order flow. Solo watchlist — no "
+        "genera alertas de trading ni posiciones."
+    )
+
+    _watch_rows = _cached_accumulation_watch_list(limit=50)
+    if not _watch_rows:
+        st.info("Sin símbolos activos en la watchlist de acumulación.")
+    else:
+        _watch_symbols = [w["symbol"] for w in _watch_rows]
+        _news_map = _cached_latest_news_predictions(tuple(sorted(_watch_symbols)))
+
+        _watch_table = []
+        for w in _watch_rows:
+            _news = _news_map.get(w["symbol"], {})
+            _dist_atl = w.get("dist_to_atl_pct")
+            _sentiment = _news.get("sentiment_score")
+            _watch_table.append({
+                "Símbolo":        w["symbol"],
+                "Canal":          w.get("channel") or "coiling",
+                "Score":          float(w.get("channel_score") or 0.0),
+                # Preformateadas a texto (no numéricas + na_rep): st.dataframe
+                # no respeta Styler.format(na_rep=...) para nulos, los muestra
+                # como "None" — mismo patrón que Noticias/Razón ignición abajo.
+                "Dist. ATL %":    f"{float(_dist_atl):+.1f}" if _dist_atl is not None else "—",
+                "Días en zona":   w.get("days_in_atl_zone"),
+                "Noticias":       _news.get("prediction", "—"),
+                "Sentimiento":    f"{float(_sentiment):+.1f}" if _sentiment is not None else "—",
+                "Estado":         w.get("status") or "watching",
+                "Razón ignición": w.get("ignition_reason") or "—",
+                "Desde":          _utc_to_local(w.get("first_seen", ""), fmt="%d/%m %H:%M"),
+            })
+        _df_watch = pd.DataFrame(_watch_table)
+        st.dataframe(
+            _df_watch.style
+            .map(lambda v: "background-color:#052e16;color:#86efac" if v == "ignited" else "", subset=["Estado"])
+            .format({"Score": "{:.1f}"}),
+            use_container_width=True,
+            height=min(420, 60 + 35 * len(_df_watch)),
+        )
+
+        _sel_watch_symbol = st.selectbox("Símbolo", _watch_symbols, key="accum_watch_chart_symbol")
+        _sel_watch_row = next(w for w in _watch_rows if w["symbol"] == _sel_watch_symbol)
+
+        _since_iso = _sel_watch_row.get("first_seen") or ""
+        _hist_w = _cached_symbol_price_history_with_cvd(_sel_watch_symbol, _since_iso) if _since_iso else []
+
+        if not _hist_w:
+            st.info("Sin historial de precio guardado todavía para este símbolo.")
+        else:
+            _hw_x: List[Any] = []
+            for _h in _hist_w:
+                try:
+                    _hw_x.append(datetime.datetime.fromisoformat(_h["timestamp"]))
+                except Exception:
+                    _hw_x.append(None)
+
+            # Corte de huecos >30min (mismo criterio que el panel Value Area+CVD
+            # más arriba) — sin esto Plotly conecta con una diagonal falsa un
+            # tramo donde el símbolo salió temporalmente de los candidatos.
+            _GAP_MIN = 30.0
+            _wx: List[Any] = []
+            _wy_price: List[Optional[float]] = []
+            _wy_cvd: List[Optional[float]] = []
+            _wprev: Optional[datetime.datetime] = None
+            for _x, _h in zip(_hw_x, _hist_w):
+                if _x is not None and _wprev is not None:
+                    _gap_min = (_x - _wprev).total_seconds() / 60.0
+                    if _gap_min > _GAP_MIN:
+                        _wx.append(_wprev + (_x - _wprev) / 2)
+                        _wy_price.append(None)
+                        _wy_cvd.append(None)
+                _wx.append(_x)
+                _wy_price.append(_h.get("price"))
+                _wy_cvd.append(_h.get("cvd_15m"))
+                if _x is not None:
+                    _wprev = _x
+
+            fig_watch = go.Figure()
+            fig_watch.add_trace(go.Scatter(
+                x=_wx, y=_wy_price, mode="lines",
+                line=dict(color="#e5e7eb", width=1.5), name="Precio (futuros)",
+                connectgaps=False,
+            ))
+            fig_watch.add_trace(go.Scatter(
+                x=_wx, y=_wy_cvd, mode="lines",
+                line=dict(color="#22c55e", width=1.5, dash="dot"),
+                name="CVD 15m", yaxis="y2", connectgaps=False,
+            ))
+            _atl_price = _sel_watch_row.get("atl_price")
+            if _atl_price:
+                fig_watch.add_hline(
+                    y=_atl_price, line=dict(color="#ef4444", width=1, dash="dot"),
+                    annotation_text=f"ATL ({_sel_watch_row.get('atl_date', '')})",
+                    annotation_position="bottom right",
+                )
+            if _sel_watch_row.get("status") == "ignited" and _sel_watch_row.get("ignited_at"):
+                try:
+                    _ignited_x = datetime.datetime.fromisoformat(_sel_watch_row["ignited_at"])
+                    fig_watch.add_vline(
+                        x=_ignited_x, line=dict(color="#facc15", width=1.5),
+                        annotation_text="Ignición", annotation_position="top",
+                    )
+                except Exception:
+                    pass
+            fig_watch.update_layout(
+                title=dict(text=f"{_sel_watch_symbol} — precio + CVD 15m desde entrada a watchlist", y=0.98),
+                xaxis_title="Hora UTC", yaxis_title="Precio",
+                yaxis2=dict(title="CVD 15m", overlaying="y", side="right", showgrid=False),
+                legend=dict(orientation="h", yanchor="top", y=-0.22, x=0.5, xanchor="center"),
+                margin=dict(t=70, b=110),
+                height=440,
+            )
+            st.plotly_chart(fig_watch, use_container_width=True)
+            st.caption(
+                "Línea roja punteada: mínimo histórico real (ATL), calculado sobre el "
+                "histórico diario completo del símbolo. Línea amarilla vertical: momento "
+                "de ignición (breakout de estructura confirmado con CVD/order flow, o "
+                "pico de volumen/funding). Los huecos en las líneas marcan tramos sin "
+                "snapshots — el símbolo salió temporalmente de los candidatos del scanner."
+            )
 
 
 # ── Framework multi-estrategia: trades y anticipación de tendencia ───────

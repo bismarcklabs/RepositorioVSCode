@@ -1524,30 +1524,42 @@ def get_latest_symbol_price(symbol: str) -> float:
         return 0.0
 
 
-def get_symbol_price_history(symbol: str, since_iso: str) -> List[Dict[str, Any]]:
+def get_symbol_price_history(
+    symbol: str, since_iso: str, include_cvd_15m: bool = False
+) -> List[Dict[str, Any]]:
     """Serie de precio (preferentemente futuros, mismo criterio que el resto del
     modulo) + delta por ciclo para un simbolo desde since_iso — usada para
     graficar el value area sobre la serie de precio real ya guardada en cada
     ciclo del scanner, y para reconstruir el CVD acumulado de sesion (misma
-    suma que value_area_core.py hace en memoria: cvd_session += delta)."""
+    suma que value_area_core.py hace en memoria: cvd_session += delta).
+
+    `include_cvd_15m=True` añade cvd_15m ya persistido (sin reconstrucción de
+    sesión) — usado por el panel de Accumulation Watch, que no tiene noción
+    de "sesión" como value_area."""
     try:
+        cols = "timestamp, COALESCE(NULLIF(futures_price, 0), price) AS price, delta"
+        if include_cvd_15m:
+            cols += ", cvd_15m"
         rows = _get_conn().execute(
-            """
-            SELECT timestamp, COALESCE(NULLIF(futures_price, 0), price) AS price, delta
+            f"""
+            SELECT {cols}
             FROM market_snapshots
             WHERE symbol=? AND timestamp >= ?
             ORDER BY timestamp ASC
             """,
             (symbol, since_iso),
         ).fetchall()
-        return [
-            {
+        results = []
+        for r in rows:
+            item = {
                 "timestamp": r["timestamp"],
                 "price": float(r["price"] or 0.0),
                 "delta": float(r["delta"] or 0.0),
             }
-            for r in rows
-        ]
+            if include_cvd_15m:
+                item["cvd_15m"] = float(r["cvd_15m"] or 0.0)
+            results.append(item)
+        return results
     except Exception:
         logger.exception("Error al obtener historial de precio de %s", symbol)
         return []
@@ -2252,3 +2264,66 @@ def get_accumulation_watch_list(limit: int = 50) -> List[Dict[str, Any]]:
     except Exception:
         logger.exception("Error listando accumulation_watch")
         return []
+
+
+def get_accumulation_watch_row(symbol: str) -> Optional[Dict[str, Any]]:
+    """Fila completa de un símbolo en accumulation_watch, o None si no existe."""
+    try:
+        row = _get_conn().execute(
+            "SELECT * FROM accumulation_watch WHERE symbol=?", (symbol,)
+        ).fetchone()
+        return dict(row) if row else None
+    except Exception:
+        logger.exception("Error obteniendo accumulation_watch_row para %s", symbol)
+        return None
+
+
+def update_accumulation_deep_value(symbol: str, deep: Dict[str, Any]) -> None:
+    """Persiste distancia al ATL real + tiempo en zona (ver
+    accumulation_scanner.compute_deep_value_metrics) — columnas dedicadas,
+    independientes del canal que detectó al símbolo."""
+    try:
+        conn = _get_conn()
+        conn.execute(
+            """
+            UPDATE accumulation_watch
+            SET atl_price=?, atl_date=?, dist_to_atl_pct=?, days_in_atl_zone=?,
+                deep_value_checked_at=?
+            WHERE symbol=?
+            """,
+            (
+                deep.get("atl_price"), deep.get("atl_date"),
+                deep.get("dist_to_atl_pct"), deep.get("days_in_atl_zone"),
+                _now_iso(), symbol,
+            ),
+        )
+        conn.commit()
+    except Exception:
+        logger.exception("Error actualizando deep value para %s", symbol)
+
+
+def get_latest_news_predictions(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Última fila de news_predictions por símbolo, en una sola query
+    (evita N+1 al renderizar paneles con muchos símbolos, ej. Accumulation
+    Watch). Retorna {} si `symbols` está vacío."""
+    if not symbols:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(symbols))
+        rows = _get_conn().execute(
+            f"""
+            SELECT p.symbol, p.prediction, p.sentiment_score, p.confidence, p.timestamp
+            FROM news_predictions p
+            INNER JOIN (
+                SELECT symbol, MAX(timestamp) AS max_ts
+                FROM news_predictions
+                WHERE symbol IN ({placeholders})
+                GROUP BY symbol
+            ) latest ON p.symbol = latest.symbol AND p.timestamp = latest.max_ts
+            """,
+            symbols,
+        ).fetchall()
+        return {row["symbol"]: dict(row) for row in rows}
+    except Exception:
+        logger.exception("Error obteniendo ultimas news_predictions")
+        return {}

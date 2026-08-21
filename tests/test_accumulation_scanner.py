@@ -324,6 +324,9 @@ def test_run_accumulation_scan_persists_candidates(fresh_db, monkeypatch):
         recent_high=102, recent_low=100, recent_close=100, recent_days=14,
     )
     monkeypatch.setattr(acc, "get_klines", lambda symbol, interval="1d", limit=90: coiling_klines)
+    # Evita I/O de red real del paso de deep value (ensure_history/get_klines_df)
+    monkeypatch.setattr(acc, "ensure_history", lambda *a, **kw: 0)
+    monkeypatch.setattr(acc, "get_klines_df", lambda *a, **kw: _daily_df(atl=90.0, close=100.0))
 
     candidates = acc.run_accumulation_scan()
     assert len(candidates) == 1
@@ -332,6 +335,137 @@ def test_run_accumulation_scan_persists_candidates(fresh_db, monkeypatch):
     assert "ABCUSDT" in watch_map
     assert watch_map["ABCUSDT"]["funding_at_watch"] == pytest.approx(0.0004)
     assert watch_map["ABCUSDT"]["channel"] == "coiling"
+    # Gap 1: deep value se calcula y persiste en el mismo scan
+    assert watch_map["ABCUSDT"]["dist_to_atl_pct"] == pytest.approx((100.0 - 90.0) / 90.0 * 100.0)
+    assert watch_map["ABCUSDT"]["deep_value_checked_at"]
+
+
+# ── compute_deep_value_metrics / _maybe_refresh_deep_value ──────────────────
+
+def _daily_df(atl=80.0, close=100.0, n=30, atl_at=10, band_break_at=None):
+    """DataFrame sintético de klines diarias (mismas columnas que
+    historical_cache.get_klines_df) con un mínimo (ATL) conocido en el
+    índice `atl_at` y, opcionalmente, un cierre que rompe la banda de zona
+    en `band_break_at` (para test de `days_in_atl_zone`)."""
+    import pandas as pd
+    import datetime
+
+    closes = [close] * n
+    lows = [atl + 5.0] * n
+    lows[atl_at] = atl
+    if band_break_at is not None:
+        for i in range(band_break_at):
+            closes[i] = atl * 5.0   # muy por fuera de la banda
+    start = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+    return pd.DataFrame({
+        "open_time": [start + datetime.timedelta(days=i) for i in range(n)],
+        "open": closes, "high": [c + 1 for c in closes], "low": lows,
+        "close": closes, "volume": [1000.0] * n,
+    })
+
+
+def test_compute_deep_value_metrics_calcula_atl_y_dias_en_zona(monkeypatch):
+    import app.accumulation_scanner as acc
+
+    monkeypatch.setattr(acc, "ensure_history", lambda *a, **kw: 0)
+    # ATL=80 en el día 10; los primeros 5 días (0-4) cierran muy por fuera de
+    # la banda del 20% sobre el ATL (80*1.2=96) — el conteo de días en zona
+    # debe cortar ahí al recorrer desde el más reciente hacia atrás.
+    monkeypatch.setattr(acc, "get_klines_df", lambda *a, **kw: _daily_df(atl=80.0, close=90.0, n=30, atl_at=10, band_break_at=5))
+
+    result = acc.compute_deep_value_metrics("ABCUSDT")
+    assert result is not None
+    assert result["atl_price"] == pytest.approx(80.0)
+    assert result["dist_to_atl_pct"] == pytest.approx((90.0 - 80.0) / 80.0 * 100.0)
+    assert result["days_in_atl_zone"] == 30 - 5
+
+
+def test_compute_deep_value_metrics_insufficient_data_returns_none(monkeypatch):
+    import app.accumulation_scanner as acc
+    import pandas as pd
+
+    monkeypatch.setattr(acc, "ensure_history", lambda *a, **kw: 0)
+    monkeypatch.setattr(acc, "get_klines_df", lambda *a, **kw: pd.DataFrame())
+    assert acc.compute_deep_value_metrics("ABCUSDT") is None
+
+
+def test_maybe_refresh_deep_value_skips_within_refresh_window(fresh_db, monkeypatch):
+    import app.accumulation_scanner as acc
+
+    fresh_db.upsert_accumulation_watch(_watch_payload())
+    fresh_db.update_accumulation_deep_value("ABCUSDT", {
+        "atl_price": 1.0, "atl_date": "2026-01-01",
+        "dist_to_atl_pct": 5.0, "days_in_atl_zone": 10,
+    })
+
+    called = {"n": 0}
+    def _fake_compute(symbol, **kw):
+        called["n"] += 1
+        return {"atl_price": 1.0, "atl_date": "2026-01-01", "dist_to_atl_pct": 5.0, "days_in_atl_zone": 11}
+    monkeypatch.setattr(acc, "compute_deep_value_metrics", _fake_compute)
+
+    acc._maybe_refresh_deep_value("ABCUSDT")
+    assert called["n"] == 0   # dentro de la ventana de refresh (24h default), no recalcula
+
+
+# ── check_structural_ignition_trigger ────────────────────────────────────────
+
+def _result_row(confirmed=True, direction="up", cvd_15m=1.0, footprint_delta=1.0,
+                 stacked_buy=False, ob_imbalance=0.0):
+    return {
+        "structure": {"breakout": {"confirmed": confirmed, "direction": direction,
+                                    "level": 100.0, "margin_pct": 0.5}},
+        "metrics": {"cvd_15m": cvd_15m},
+        "footprint": {"footprint_delta": footprint_delta, "stacked_buy_imbalance": stacked_buy},
+        "orderbook": {"imbalance": ob_imbalance},
+    }
+
+
+def test_structural_ignition_requiere_breakout_confirmado():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(confirmed=False)
+    assert check_structural_ignition_trigger({}, row) is None
+
+
+def test_structural_ignition_requiere_direccion_up():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(direction="down")
+    assert check_structural_ignition_trigger({}, row) is None
+
+
+def test_structural_ignition_requiere_cvd_no_negativo():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(cvd_15m=-1.0)
+    assert check_structural_ignition_trigger({}, row) is None
+
+
+def test_structural_ignition_requiere_order_flow():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(footprint_delta=0.0, stacked_buy=False, ob_imbalance=0.0)
+    assert check_structural_ignition_trigger({}, row) is None
+
+
+def test_structural_ignition_confirma_con_footprint_delta():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(footprint_delta=5.0, ob_imbalance=0.0)
+    reason = check_structural_ignition_trigger({}, row)
+    assert reason is not None
+    assert "structural_breakout_cvd_confirmed" in reason
+
+
+def test_structural_ignition_confirma_con_orderbook_imbalance():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(footprint_delta=0.0, stacked_buy=False, ob_imbalance=0.15)
+    reason = check_structural_ignition_trigger({}, row)
+    assert reason is not None
+    assert "structural_breakout_cvd_confirmed" in reason
+
+
+def test_structural_ignition_confirma_con_stacked_buy_imbalance():
+    from app.accumulation_scanner import check_structural_ignition_trigger
+    row = _result_row(footprint_delta=0.0, stacked_buy=True, ob_imbalance=0.0)
+    reason = check_structural_ignition_trigger({}, row)
+    assert reason is not None
 
 
 # ── channel/channel_score genericos (watchlist multi-canal) ─────────────────

@@ -341,6 +341,24 @@ ACCUMULATION_OI_ACCELERATION_LOOKBACK_HOURS = float(os.getenv("ACCUMULATION_OI_A
 # barrido de OI por simbolo es el mas costoso de los 3 canales.
 CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS = float(os.getenv("CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS", "6"))
 
+# ── Deep Value: distancia al minimo historico real (ATL) + tiempo en zona ──
+# Solo se calcula para simbolos YA clasificados por un canal de accumulation
+# watch (no sobre el universo extendido completo) — usa historical_cache
+# .ensure_history() (backfill incremental de velas 1d) para no repetir el
+# historico completo en cada scan.
+ACCUMULATION_DEEP_VALUE_ENABLED = os.getenv("ACCUMULATION_DEEP_VALUE_ENABLED", "true").lower() == "true"
+ACCUMULATION_DEEP_VALUE_REFRESH_HOURS = float(os.getenv("ACCUMULATION_DEEP_VALUE_REFRESH_HOURS", "24"))
+ACCUMULATION_ATL_ZONE_BAND_PCT = float(os.getenv("ACCUMULATION_ATL_ZONE_BAND_PCT", "20.0"))
+
+# ── Ignicion estructural: breakout confirmado + CVD + order flow alineados ──
+# Via adicional a check_ignition_trigger() (RVOL/funding) — exige ademas
+# estructura (structure_levels.py) + CVD 15m + footprint/orderbook, tesis
+# long-only (accumulation watch nunca es tesis short).
+ACCUMULATION_STRUCTURAL_IGNITION_ENABLED = os.getenv("ACCUMULATION_STRUCTURAL_IGNITION_ENABLED", "true").lower() == "true"
+ACCUMULATION_STRUCTURAL_IGNITION_MIN_CVD_15M = float(os.getenv("ACCUMULATION_STRUCTURAL_IGNITION_MIN_CVD_15M", "0.0"))
+# Mismo umbral que _flow_checks() en app/main.py (imbalance >= 0.08) — consistencia con el resto del sistema.
+ACCUMULATION_STRUCTURAL_IGNITION_MIN_OB_IMBALANCE = float(os.getenv("ACCUMULATION_STRUCTURAL_IGNITION_MIN_OB_IMBALANCE", "0.08"))
+
 # ── Notificaciones — Email ────────────────────────────────────────────────
 ENABLE_EMAIL_ALERTS = os.getenv("ENABLE_EMAIL_ALERTS", "false").lower() == "true"
 SMTP_HOST = os.getenv("SMTP_HOST", "")

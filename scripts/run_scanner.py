@@ -66,6 +66,7 @@ from app.config import (
     ACCUMULATION_WATCHLIST_MAX_SIZE,
     ACCUMULATION_FUNDING_EXTREME_ENABLED,
     ACCUMULATION_OI_ACCELERATION_ENABLED,
+    ACCUMULATION_STRUCTURAL_IGNITION_ENABLED,
     CANDIDATE_DISCOVERY_SCAN_INTERVAL_HOURS,
     SHORT_FUTURES_BLACKOUT_HOURS,
     LONG_FUTURES_BLACKOUT_HOURS,
@@ -118,7 +119,11 @@ from app.trend_continuation import (
     is_short_momentum_continuation,
     calculate_trend_priority_score,
 )
-from app.accumulation_scanner import run_accumulation_scan, check_ignition_trigger
+from app.accumulation_scanner import (
+    run_accumulation_scan,
+    check_ignition_trigger,
+    check_structural_ignition_trigger,
+)
 from app.candidate_discovery import run_candidate_discovery_scan
 
 # Pool interno persistente: 6 workers externos × 11 llamadas = 66 tareas simultáneas.
@@ -818,7 +823,8 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
     )
 
     # Accumulation Watch: detectar "ignición" (volumen relativo súbito o
-    # funding cruzando hacia/bajo cero) en símbolos de la fast-cycle watchlist.
+    # funding cruzando hacia/bajo cero, o breakout de estructura confirmado
+    # con CVD + order flow alineados) en símbolos de la fast-cycle watchlist.
     if accumulation_watch_map:
         for r in results:
             watch_entry = accumulation_watch_map.get(r["symbol"])
@@ -826,6 +832,8 @@ def run_scan_cycle(candidate_limit: int) -> List[Dict[str, Any]]:
                 continue
             try:
                 reason = check_ignition_trigger(watch_entry, r.get("technical") or {}, r.get("funding", 0.0))
+                if not reason and ACCUMULATION_STRUCTURAL_IGNITION_ENABLED:
+                    reason = check_structural_ignition_trigger(watch_entry, r)
             except Exception:
                 reason = None
             if reason:

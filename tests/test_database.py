@@ -400,3 +400,84 @@ def test_compact_structure_caps_levels():
     compact = json.loads(db._compact_structure(many))
     assert len(compact["levels"]) == 6
     assert db._compact_structure(None) == "{}"
+
+
+# ── Deep value / accumulation_watch (Gap 1) ──────────────────────────────────
+
+def _watch_payload(symbol="ABCUSDT", **overrides):
+    payload = {
+        "symbol": symbol, "coiling_score": 60.0, "contraction_ratio": 0.15,
+        "position_in_range": 0.1, "above_sma50": False, "vol_ratio_7_30": 1.5,
+        "quote_volume": 3_000_000.0, "funding_at_watch": 0.0003, "price_at_watch": 1.234,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_accumulation_watch_schema_has_deep_value_columns(fresh_db):
+    cols = {r["name"] for r in fresh_db._get_conn().execute(
+        "PRAGMA table_info(accumulation_watch)"
+    ).fetchall()}
+    assert {"atl_price", "atl_date", "dist_to_atl_pct", "days_in_atl_zone",
+            "deep_value_checked_at"} <= cols
+
+
+def test_get_accumulation_watch_row(fresh_db):
+    assert fresh_db.get_accumulation_watch_row("ABCUSDT") is None
+    fresh_db.upsert_accumulation_watch(_watch_payload())
+    row = fresh_db.get_accumulation_watch_row("ABCUSDT")
+    assert row is not None
+    assert row["symbol"] == "ABCUSDT"
+    assert row["status"] == "watching"
+
+
+def test_update_accumulation_deep_value(fresh_db):
+    fresh_db.upsert_accumulation_watch(_watch_payload())
+    fresh_db.update_accumulation_deep_value("ABCUSDT", {
+        "atl_price": 0.5, "atl_date": "2025-03-01",
+        "dist_to_atl_pct": 12.5, "days_in_atl_zone": 40,
+    })
+    row = fresh_db.get_accumulation_watch_row("ABCUSDT")
+    assert row["atl_price"] == pytest.approx(0.5)
+    assert row["atl_date"] == "2025-03-01"
+    assert row["dist_to_atl_pct"] == pytest.approx(12.5)
+    assert row["days_in_atl_zone"] == 40
+    assert row["deep_value_checked_at"]
+    # No debe pisar las columnas del canal que lo detectó
+    assert row["coiling_score"] == pytest.approx(60.0)
+    assert row["status"] == "watching"
+
+
+def test_get_latest_news_predictions_batch(fresh_db):
+    assert fresh_db.get_latest_news_predictions([]) == {}
+    assert fresh_db.get_latest_news_predictions(["NOPEUSDT"]) == {}
+
+    fresh_db.insert_news_prediction({
+        "timestamp": "2026-08-10T10:00:00", "symbol": "BTCUSDT",
+        "prediction": "BEARISH", "sentiment_score": -5, "confidence": 60,
+    })
+    fresh_db.insert_news_prediction({
+        "timestamp": "2026-08-15T10:00:00", "symbol": "BTCUSDT",
+        "prediction": "BULLISH", "sentiment_score": 7, "confidence": 80,
+    })
+    fresh_db.insert_news_prediction({
+        "timestamp": "2026-08-12T10:00:00", "symbol": "ETHUSDT",
+        "prediction": "NEUTRAL", "sentiment_score": 0, "confidence": 40,
+    })
+
+    latest = fresh_db.get_latest_news_predictions(["BTCUSDT", "ETHUSDT"])
+    assert set(latest) == {"BTCUSDT", "ETHUSDT"}
+    assert latest["BTCUSDT"]["prediction"] == "BULLISH"   # la más reciente, no la primera insertada
+    assert latest["ETHUSDT"]["prediction"] == "NEUTRAL"
+
+
+def test_get_symbol_price_history_incluye_cvd_15m_opcional(fresh_db):
+    snap = _make_snapshot("ABCUSDT")
+    snap["metrics"]["cvd_15m"] = 42.0
+    fresh_db.insert_snapshots_batch([snap])
+
+    default_hist = fresh_db.get_symbol_price_history("ABCUSDT", "2020-01-01T00:00:00")
+    assert default_hist and "cvd_15m" not in default_hist[0]
+
+    with_cvd = fresh_db.get_symbol_price_history("ABCUSDT", "2020-01-01T00:00:00", include_cvd_15m=True)
+    assert with_cvd and with_cvd[0]["cvd_15m"] == pytest.approx(42.0)
